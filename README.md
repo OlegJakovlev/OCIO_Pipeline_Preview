@@ -16,12 +16,10 @@ py -3.12 ocio_pipeline_viewer.py
 
 ## Application
 ### Tabs
- - Viewer   - compact controls on the left, two linked 3D viewports on the right.
+ - Viewer   - minimal controls on the left, sRGB and ACEScg 3D realtime viewports on the right.
  ![alt text](images/viewer_tab.png)
  
- - Pipeline - every step as a thumbnail of the texture (Input -> Working space ->
-              Input matrix -> View transform), each with its own dropdown, followed by
-              the two renderers. Dropdowns are synced with the Viewer-tab controls.
+ - Pipeline - every conversion step with a thumbnail, with possibility to choose renderer.
  ![alt text](images/pipeline_tab.png)
  
 ### Viewport controls:
@@ -35,7 +33,6 @@ py -3.12 ocio_pipeline_viewer.py
  2. Optional conversion to ACEScg      -> decode to linear Rec.709, then gamut
                                           Rec.709 -> ACEScg (OCIO, or your own 3x3 matrix)
  3. View transform (OCIO display/view) -> applied to both 3D viewports
- 4. The same "final texture" on a selectable 3D primitive, shown in two real-time
-    OpenGL viewports: an sRGB renderer (Linear Rec.709 working space) and an
-    ACEScg renderer. The cameras are linked.
+ 4. Select 3D primitive
+ 5. Observe viewports: an sRGB renderer (Linear Rec.709 working space) and an ACEScg renderer.
 	

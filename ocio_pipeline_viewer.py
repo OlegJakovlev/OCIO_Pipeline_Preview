@@ -813,18 +813,10 @@ class MainWindow(QtWidgets.QMainWindow):
         l2.addWidget(note)
         left.addWidget(g2)
 
-        g3 = QtWidgets.QGroupBox("3 · View transform")
-        l3 = QtWidgets.QFormLayout(g3)
-        self.cmb_view = QtWidgets.QComboBox()
-        self.lbl_display = QtWidgets.QLabel()
-        l3.addRow("Display:", self.lbl_display)
-        l3.addRow("View:", self.cmb_view)
-        left.addWidget(g3)
-
-        g4 = QtWidgets.QGroupBox("4 · Input matrix override (Rec.709 → ACEScg gamut step)")
-        l4 = QtWidgets.QVBoxLayout(g4)
+        g3 = QtWidgets.QGroupBox("3 · Input matrix override (Rec.709 → ACEScg gamut step)")
+        l3 = QtWidgets.QVBoxLayout(g3)
         self.chk_matrix = QtWidgets.QCheckBox("Override OCIO gamut matrix")
-        l4.addWidget(self.chk_matrix)
+        l3.addWidget(self.chk_matrix)
         grid = QtWidgets.QGridLayout()
         self.spins: list[QtWidgets.QDoubleSpinBox] = []
         for i in range(9):
@@ -835,10 +827,18 @@ class MainWindow(QtWidgets.QMainWindow):
             sb.valueChanged.connect(self.schedule_texture)
             grid.addWidget(sb, i // 3, i % 3)
             self.spins.append(sb)
-        l4.addLayout(grid)
+        l3.addLayout(grid)
         btn_reset = QtWidgets.QPushButton("Reset to OCIO matrix")
         btn_reset.clicked.connect(self.reset_matrix)
-        l4.addWidget(btn_reset)
+        l3.addWidget(btn_reset)
+        left.addWidget(g3)
+
+        g4 = QtWidgets.QGroupBox("4 · View transform")
+        l4 = QtWidgets.QFormLayout(g4)
+        self.cmb_view = QtWidgets.QComboBox()
+        self.lbl_display = QtWidgets.QLabel()
+        l4.addRow("Display:", self.lbl_display)
+        l4.addRow("View:", self.cmb_view)
         left.addWidget(g4)
 
         btn_cfg = QtWidgets.QPushButton("Load OCIO config…")
