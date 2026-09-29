@@ -25,7 +25,7 @@ from PIL import Image
 from PySide6 import QtCore, QtGui, QtWidgets
 
 DEFAULT_CONFIG = "ocio://cg-config-latest"  # built-in config (OCIO >= 2.3)
-MAX_RENDER_SIZE = 720  # longest side of the rendered image, in pixels
+MAX_RENDER_SIZE = 1024  # longest side of the rendered image, in pixels
 MAX_TEX_SIZE = 1024
 
 # Candidate colour-space names/aliases across the built-in ACES CG/Studio configs
