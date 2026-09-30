@@ -9,24 +9,22 @@ refines to full resolution when you stop.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
+import re
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import numpy as np
 
-# OpenCV disables the OpenEXR codec by default due to security concerns regarding untrusted image sources
-os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")  # must be set before cv2 import
 
 import PyOpenColorIO as OCIO
 from OpenGL import GL as gl
 from PIL import Image
 from PySide6 import QtCore, QtGui, QtWidgets
 
-DEFAULT_CONFIG = "ocio://cg-config-latest"  # built-in config (OCIO >= 2.3)
-MAX_RENDER_SIZE = 1024  # longest side of the rendered image, in pixels
-MAX_TEX_SIZE = 1024
 
 # Candidate colour-space names/aliases across the built-in ACES CG/Studio configs
 CS_SRGB_TEXTURE = ["sRGB - Texture", "srgb_tx", "sRGB Encoded Rec.709 (sRGB)", "Utility - sRGB - Texture"]
@@ -46,7 +44,8 @@ class OcioContext:
         self.acescg = self._find_cs(CS_ACESCG, "ACEScg")
 
         displays = list(config.getDisplays())
-        self.display = next((d for d in DISPLAY_CANDIDATES if d in displays), None) or config.getDefaultDisplay()
+        self.display = next((d for d in DISPLAY_CANDIDATES if d in displays), None) \
+            or config.getDefaultDisplay()
         self.views = list(config.getViews(self.display))
         self.default_view = config.getDefaultView(self.display)
         self._display_cpu: dict[tuple[str, str], OCIO.CPUProcessor] = {}
@@ -54,10 +53,8 @@ class OcioContext:
     def _find_cs(self, names: list[str], what: str) -> str:
         for n in names:
             cs = self.config.getColorSpace(n)
-            
             if cs is not None:
                 return cs.getName()
-
         raise RuntimeError(f"Config has no colour space for '{what}' (tried {names})")
 
     @staticmethod
@@ -73,7 +70,6 @@ class OcioContext:
 
     def to_display(self, arr: np.ndarray, src: str, view: str) -> np.ndarray:
         cpu = self._display_cpu.get((src, view))
-        
         if cpu is None:
             dvt = OCIO.DisplayViewTransform()
             dvt.setSrc(src)
@@ -96,10 +92,8 @@ class OcioContext:
 def box_downscale(arr: np.ndarray, max_size: int) -> np.ndarray:
     h, w, _ = arr.shape
     k = int(np.ceil(max(h, w) / max_size))
-
     if k <= 1:
         return arr
-    
     h2, w2 = h // k * k, w // k * k
     return arr[:h2, :w2].reshape(h2 // k, k, w2 // k, k, 3).mean(axis=(1, 3)).astype(np.float32)
 
@@ -108,16 +102,13 @@ def read_with_cv2(path: str) -> np.ndarray:
     try:
         import cv2
     except ImportError as e:
-        raise RuntimeError("Reading this file needs `pip install OpenEXR` (EXR) or `pip install opencv-python`") from e
-    
+        raise RuntimeError("Reading this file needs `pip install OpenEXR` (EXR) "
+                           "or `pip install opencv-python`") from e
     a = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-
     if a is None:
         raise RuntimeError(f"Could not read {path}")
-
     if a.ndim == 2:
         a = np.stack([a] * 3, -1)
-
     return np.ascontiguousarray(a[..., :3][..., ::-1], dtype=np.float32)  # BGR -> RGB
 
 
@@ -146,40 +137,234 @@ def read_exr(path: str) -> np.ndarray:
             a = np.stack([ch["Y"].pixels] * 3, -1)
         else:  # unusual layer names: take the first three channels alphabetically
             names = sorted(ch)[:3]
-            
             if not names:
                 raise RuntimeError("EXR contains no channels")
             names += [names[-1]] * (3 - len(names))
             a = np.stack([ch[n].pixels for n in names], -1)
-            
         return np.ascontiguousarray(a, dtype=np.float32)  # half -> float32
 
 
-def load_image(path: str) -> tuple[np.ndarray, bool]:
+def load_image(path: str, max_size: int = 1024) -> tuple[np.ndarray, bool]:
     """Returns (float32 RGB array, is_float_file). Float files (EXR/HDR) are normally linear."""
     ext = Path(path).suffix.lower()
-    
     if ext == ".exr":
-        return box_downscale(read_exr(path), MAX_TEX_SIZE), True
-    
+        return box_downscale(read_exr(path), max_size), True
     if ext == ".hdr":
-        return box_downscale(read_with_cv2(path), MAX_TEX_SIZE), True
+        return box_downscale(read_with_cv2(path), max_size), True
 
     img = Image.open(path)
-    
     if img.mode.startswith("I"):  # 16-bit greyscale
         a = np.asarray(img, dtype=np.float32) / 65535.0
         a = np.stack([a] * 3, -1)
     else:
         a = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-        
-    return box_downscale(a, MAX_TEX_SIZE), False
+    return box_downscale(a, max_size), False
 
 
 def to_qimage(u8: np.ndarray) -> QtGui.QImage:
     u8 = np.ascontiguousarray(u8)
     h, w, _ = u8.shape
     return QtGui.QImage(u8.data, w, h, 3 * w, QtGui.QImage.Format.Format_RGB888).copy()
+
+
+# --------------------------------------------------------------------------- #
+# Settings (all tunable "magic numbers"; edited in the Settings tab, saved with QSettings)
+# --------------------------------------------------------------------------- #
+@dataclass
+class SettingsData:
+    # rendering quality
+    max_render_size: int = 720
+    interactive_scale: float = 0.5
+    refine_delay_ms: int = 200
+    msaa_samples: int = 4
+    anisotropy: float = 8.0
+    mesh_detail: int = 64
+    max_texture_size: int = 1024
+    # stage thumbnails
+    thumb_source_size: int = 256
+    thumb_width: int = 240
+    thumb_height: int = 180
+    thumb_render_width: int = 360
+    thumb_render_height: int = 270
+    # camera
+    fov_deg: float = 35.0
+    cam_yaw_deg: float = 25.0
+    cam_pitch_deg: float = 15.0
+    cam_distance: float = 3.8
+    orbit_sensitivity: float = 0.008
+    zoom_step: float = 0.88
+    # shading (colours are Linear Rec.709; converted for each renderer)
+    key_color: tuple = (3.0, 2.3, 1.6)
+    fill_color: tuple = (0.35, 0.55, 1.0)
+    ambient: tuple = (0.10, 0.10, 0.10)
+    background: tuple = (0.03, 0.03, 0.035)
+    key_dir: tuple = (-0.5, 0.6, 0.65)
+    fill_dir: tuple = (0.7, -0.1, 0.4)
+    spec_strength: float = 0.08
+    spec_power: float = 80.0
+    # behaviour
+    texture_debounce_ms: int = 40
+    paste_column_major: bool = False
+    default_config: str = "ocio://cg-config-latest"
+
+
+# (group title, [(field, label, kind, min, max, step, tooltip)])   kind: int|float|vec3|bool|str|choice:a,b,c
+SETTING_GROUPS = [
+    ("Rendering quality", [
+        ("max_render_size", "Max render size (px, long side)", "int", 64, 4096, 16,
+         "Upper limit for the resolution of the 3D viewports."),
+        ("interactive_scale", "Resolution scale while dragging", "float", 0.1, 1.0, 0.05,
+         "Viewports render at this fraction of full size while you orbit/zoom/pan."),
+        ("refine_delay_ms", "Full-quality refine delay (ms)", "int", 0, 5000, 10,
+         "Time after the last mouse movement before re-rendering at full resolution."),
+        ("msaa_samples", "MSAA samples", "choice:0,2,4,8", 0, 0, 0,
+         "Multisample anti-aliasing. Falls back to 0 if the GPU cannot do it."),
+        ("anisotropy", "Anisotropic filtering", "float", 1, 16, 1, "Texture sharpness at grazing angles."),
+        ("mesh_detail", "Mesh detail (latitude segments)", "int", 8, 256, 8,
+         "Segments for sphere / cylinder / torus (longitude uses twice as many)."),
+        ("max_texture_size", "Max texture size (px) - applies to next loaded image", "int", 64, 8192, 64,
+         "Loaded images are box-downscaled so their long side is at most this."),
+    ]),
+    ("Stage thumbnails (Pipeline tab)", [
+        ("thumb_source_size", "Source image size for thumbnails (px)", "int", 32, 1024, 16,
+         "The pipeline is re-run on a copy this size for the stage previews."),
+        ("thumb_width", "Thumbnail width (px)", "int", 80, 600, 10, ""),
+        ("thumb_height", "Thumbnail height (px)", "int", 60, 600, 10, ""),
+        ("thumb_render_width", "Stage render width (px)", "int", 64, 1024, 10,
+         "Resolution of stage cards set to 'sRGB / ACEScg renderer'."),
+        ("thumb_render_height", "Stage render height (px)", "int", 64, 1024, 10, ""),
+    ]),
+    ("Camera", [
+        ("fov_deg", "Field of view (deg)", "float", 5, 120, 1, ""),
+        ("cam_yaw_deg", "Default yaw (deg)", "float", -360, 360, 5, "Used by 'Reset camera' and the stage renders."),
+        ("cam_pitch_deg", "Default pitch (deg)", "float", -89, 89, 5, ""),
+        ("cam_distance", "Default distance", "float", 0.5, 40, 0.1, ""),
+        ("orbit_sensitivity", "Orbit sensitivity (rad/px)", "float", 0.0005, 0.05, 0.001, ""),
+        ("zoom_step", "Zoom factor per wheel notch", "float", 0.5, 0.99, 0.01, "Smaller = faster zoom."),
+    ]),
+    ("Shading and lights (Linear Rec.709, converted for each renderer)", [
+        ("key_color", "Key light colour", "vec3", 0, 100, 0.1, ""),
+        ("fill_color", "Fill light colour", "vec3", 0, 100, 0.05, ""),
+        ("ambient", "Ambient", "vec3", 0, 100, 0.01, ""),
+        ("background", "Background", "vec3", 0, 100, 0.005, ""),
+        ("key_dir", "Key light direction (towards light)", "vec3", -10, 10, 0.1, "Normalised automatically."),
+        ("fill_dir", "Fill light direction (towards light)", "vec3", -10, 10, 0.1, ""),
+        ("spec_strength", "Specular strength", "float", 0, 5, 0.01, ""),
+        ("spec_power", "Specular power", "float", 1, 1000, 5, ""),
+    ]),
+    ("Behaviour", [
+        ("texture_debounce_ms", "Texture rebuild delay (ms)", "int", 0, 2000, 10,
+         "Delay after a control changes before the OCIO texture is rebuilt."),
+        ("paste_column_major", "Pasted matrices are column-major", "bool", 0, 0, 0,
+         "If on, a pasted matrix is transposed after parsing."),
+        ("default_config", "Default OCIO config - applies on next start", "str", 0, 0, 0,
+         "Used when $OCIO is not set. Example: ocio://cg-config-latest or a path to a .ocio file."),
+    ]),
+]
+
+
+class Settings(QtCore.QObject):
+    """Holds SettingsData (`.d`, a stable object edited in place) and persists it as JSON."""
+    changed = QtCore.Signal(str)  # field name, or "*" for a full reset
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.d = SettingsData()
+        self._store = QtCore.QSettings("OCIOPipelineViewer", "OCIOPipelineViewer")
+        self.load()
+
+    def load(self) -> None:
+        try:
+            raw = json.loads(str(self._store.value("settings_json", "") or "{}"))
+        except (ValueError, TypeError):
+            return
+        for f in fields(SettingsData):
+            if f.name not in raw:
+                continue
+            default, v = getattr(self.d, f.name), raw[f.name]
+            try:
+                if isinstance(default, tuple):
+                    v = tuple(float(x) for x in v)
+                    if len(v) != len(default):
+                        continue
+                elif isinstance(default, bool):
+                    v = bool(v)
+                else:
+                    v = type(default)(v)
+            except (ValueError, TypeError):
+                continue
+            setattr(self.d, f.name, v)
+
+    def save(self) -> None:
+        self._store.setValue("settings_json", json.dumps(asdict(self.d)))
+
+    def set(self, name: str, value) -> None:
+        setattr(self.d, name, value)
+        self.save()
+        self.changed.emit(name)
+
+    def reset(self) -> None:
+        for f in fields(SettingsData):
+            setattr(self.d, f.name, getattr(SettingsData(), f.name))
+        self.save()
+        self.changed.emit("*")
+
+
+def scene_from_settings(d: SettingsData) -> np.ndarray:
+    """Rows: key, fill, ambient, background (Linear Rec.709)."""
+    return np.array([d.key_color, d.fill_color, d.ambient, d.background], dtype=np.float32)
+
+
+def unit_vector(v: tuple) -> np.ndarray:
+    a = np.asarray(v, dtype=np.float32)
+    n = float(np.linalg.norm(a))
+    return a / n if n > 1e-8 else np.array([0, 0, 1], dtype=np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# Matrix parsing (clipboard text -> 3x3)
+# --------------------------------------------------------------------------- #
+_NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+_BRACKET_GROUP = re.compile(r"[\[\(\{]([^\[\]\(\)\{\}]*)[\]\)\}]")
+
+
+def parse_matrix(text: str, column_major: bool = False) -> np.ndarray:
+    """Parse a 3x3 matrix from text. Supported layouts (numbers may use exponents):
+
+    * spaced/tabbed columns, one row per line        ``0.6 0.3 0.1`` / ``0.1 0.8 0.1`` / ...
+    * brackets and commas (Python/NumPy/JSON/GLSL-like) ``[[0.6, 0.3, 0.1], [...], [...]]``
+    * ``;`` as row separator (MATLAB style), or a flat list of 9 numbers
+    * 4x4 (16 numbers) or 3x4 (12 numbers): the top-left 3x3 is used
+
+    Values are row-major unless `column_major` is set (then the result is transposed).
+    """
+    t = text.replace("\u2212", "-").strip()
+    if not t:
+        raise ValueError("The clipboard is empty.")
+    groups = _BRACKET_GROUP.findall(t)
+    if groups:
+        chunks = groups
+    else:
+        chunks = [ln for ln in re.split(r"[\n\r;]+", t)]
+    rows = [nums for nums in ([float(x) for x in _NUM.findall(c)] for c in chunks) if nums]
+
+    if len(rows) >= 3 and all(len(r) >= 3 for r in rows[:3]):
+        m = [r[:3] for r in rows[:3]]
+    else:
+        flat = [x for r in rows for x in r]
+        if len(flat) == 9:
+            m = np.array(flat).reshape(3, 3)
+        elif len(flat) == 16:
+            m = np.array(flat).reshape(4, 4)[:3, :3]
+        elif len(flat) == 12:
+            m = np.array(flat).reshape(3, 4)[:, :3]
+        else:
+            raise ValueError(f"Could not find a 3x3 matrix in the clipboard (found {len(flat)} numbers "
+                             "in an unrecognised layout).")
+    arr = np.array(m, dtype=np.float64)
+    if arr.shape != (3, 3) or not np.all(np.isfinite(arr)):
+        raise ValueError("The parsed matrix is not a finite 3x3 matrix.")
+    return (arr.T if column_major else arr).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -201,8 +386,8 @@ def _grid_indices(rows: int, cols: int) -> np.ndarray:
     return np.stack([a, b, a + 1, a + 1, b, b + 1], -1).reshape(-1).astype(np.uint32)
 
 
-def mesh_sphere(_aspect: float) -> tuple[np.ndarray, np.ndarray]:
-    rows, cols = 64, 128
+def mesh_sphere(_aspect: float, detail: int = 64) -> tuple[np.ndarray, np.ndarray]:
+    rows, cols = detail, 2 * detail
     v = np.linspace(0, 1, rows + 1)[:, None]
     u = np.linspace(0, 1, cols + 1)[None, :]
     th, ph = v * np.pi, (u - 0.5) * TAU  # u = 0.5 faces +Z
@@ -214,8 +399,9 @@ def mesh_sphere(_aspect: float) -> tuple[np.ndarray, np.ndarray]:
     return _pack(pos, pos, uv), _grid_indices(rows, cols)
 
 
-def mesh_torus(_aspect: float, big_r: float = 0.72, small_r: float = 0.3) -> tuple[np.ndarray, np.ndarray]:
-    rows, cols = 64, 128
+def mesh_torus(_aspect: float, detail: int = 64, big_r: float = 0.72,
+               small_r: float = 0.3) -> tuple[np.ndarray, np.ndarray]:
+    rows, cols = detail, 2 * detail
     v = np.linspace(0, 1, rows + 1)[:, None]
     u = np.linspace(0, 1, cols + 1)[None, :]
     ph, th = (u - 0.5) * TAU, (0.5 - v) * TAU
@@ -228,7 +414,7 @@ def mesh_torus(_aspect: float, big_r: float = 0.72, small_r: float = 0.3) -> tup
     return _pack(pos, nrm, uv), _grid_indices(rows, cols)
 
 
-def mesh_plane(aspect: float) -> tuple[np.ndarray, np.ndarray]:
+def mesh_plane(aspect: float, _detail: int = 0) -> tuple[np.ndarray, np.ndarray]:
     ax, ay = min(1.0, aspect), min(1.0, 1.0 / aspect)
     pos = np.array([[-ax, ay, 0], [ax, ay, 0], [-ax, -ay, 0], [ax, -ay, 0]], dtype=np.float64)
     nrm = np.tile([0.0, 0.0, 1.0], (4, 1))
@@ -236,7 +422,7 @@ def mesh_plane(aspect: float) -> tuple[np.ndarray, np.ndarray]:
     return _pack(pos, nrm, uv), np.array([0, 2, 1, 1, 2, 3], dtype=np.uint32)
 
 
-def mesh_cube(_aspect: float, h: float = 0.7) -> tuple[np.ndarray, np.ndarray]:
+def mesh_cube(_aspect: float, _detail: int = 0, h: float = 0.7) -> tuple[np.ndarray, np.ndarray]:
     faces = [  # (normal, up)
         ((0, 0, 1), (0, 1, 0)), ((0, 0, -1), (0, 1, 0)),
         ((1, 0, 0), (0, 1, 0)), ((-1, 0, 0), (0, 1, 0)),
@@ -253,8 +439,9 @@ def mesh_cube(_aspect: float, h: float = 0.7) -> tuple[np.ndarray, np.ndarray]:
     return np.array(verts, dtype=np.float32), np.array(idx, dtype=np.uint32)
 
 
-def mesh_cylinder(_aspect: float, r: float = 0.6, h: float = 0.8) -> tuple[np.ndarray, np.ndarray]:
-    cols = 128
+def mesh_cylinder(_aspect: float, detail: int = 64, r: float = 0.6,
+                  h: float = 0.8) -> tuple[np.ndarray, np.ndarray]:
+    cols = 2 * detail
     u = np.linspace(0, 1, cols + 1)
     ph = (u - 0.5) * TAU
     sn, cs = np.sin(ph), np.cos(ph)
@@ -289,14 +476,19 @@ MESH_BUILDERS = {"Sphere": mesh_sphere, "Plane": mesh_plane, "Cube": mesh_cube,
 # --------------------------------------------------------------------------- #
 class Camera(QtCore.QObject):
     changed = QtCore.Signal()
-    FOV = np.radians(35.0)
 
-    def __init__(self) -> None:
+    def __init__(self, d: SettingsData) -> None:
         super().__init__()
+        self.d = d
         self.reset(emit=False)
 
+    @property
+    def fov(self) -> float:
+        return float(np.radians(self.d.fov_deg))
+
     def reset(self, emit: bool = True) -> None:
-        self.yaw, self.pitch, self.dist = np.radians(25.0), np.radians(15.0), 3.8
+        self.yaw, self.pitch = np.radians(self.d.cam_yaw_deg), np.radians(self.d.cam_pitch_deg)
+        self.dist = float(self.d.cam_distance)
         self.target = np.zeros(3)
         if emit:
             self.changed.emit()
@@ -319,7 +511,7 @@ class Camera(QtCore.QObject):
         return m
 
     def proj(self, aspect: float, near: float = 0.05, far: float = 100.0) -> np.ndarray:
-        f = 1.0 / np.tan(self.FOV / 2)
+        f = 1.0 / np.tan(self.fov / 2)
         m = np.zeros((4, 4))
         m[0, 0], m[1, 1] = f / aspect, f
         m[2, 2], m[2, 3] = (far + near) / (near - far), 2 * far * near / (near - far)
@@ -327,17 +519,18 @@ class Camera(QtCore.QObject):
         return m
 
     def orbit(self, dx: float, dy: float) -> None:
-        self.yaw -= dx * 0.008
-        self.pitch = float(np.clip(self.pitch + dy * 0.008, np.radians(-89), np.radians(89)))
+        k = self.d.orbit_sensitivity
+        self.yaw -= dx * k
+        self.pitch = float(np.clip(self.pitch + dy * k, np.radians(-89), np.radians(89)))
         self.changed.emit()
 
     def zoom(self, notches: float) -> None:
-        self.dist = float(np.clip(self.dist * 0.88 ** notches, 0.4, 40.0))
+        self.dist = float(np.clip(self.dist * self.d.zoom_step ** notches, 0.4, 40.0))
         self.changed.emit()
 
     def pan(self, dx: float, dy: float, height_px: float) -> None:
         v = self.view()
-        scale = 2 * self.dist * np.tan(self.FOV / 2) / max(height_px, 1)
+        scale = 2 * self.dist * np.tan(self.fov / 2) / max(height_px, 1)
         self.target = self.target + (-dx * v[0, :3] + dy * v[1, :3]) * scale
         self.changed.emit()
 
@@ -369,6 +562,7 @@ uniform sampler2D uTex;
 uniform vec3 uCam;
 uniform vec3 uKey, uFill, uAmb;      // light colours, in the renderer's working space
 uniform vec3 uLKey, uLFill;          // directions towards the lights (world space)
+uniform vec2 uSpec;                  // specular strength, power
 out vec4 outColor;
 void main() {
     vec3 N = normalize(vNrm);
@@ -377,28 +571,10 @@ void main() {
     vec3 albedo = texture(uTex, vUV).rgb;              // texture numbers used as-is
     vec3 light = uKey * max(dot(N, uLKey), 0.0) + uFill * max(dot(N, uLFill), 0.0) + uAmb;
     vec3 H = normalize(uLKey + V);
-    vec3 col = albedo * light + 0.08 * pow(max(dot(N, H), 0.0), 80.0) * uKey;
+    vec3 col = albedo * light + uSpec.x * pow(max(dot(N, H), 0.0), uSpec.y) * uKey;
     outColor = vec4(col, 1.0);
 }
 """
-
-# Scene colours authored in Linear Rec.709: key, fill, ambient, background
-SCENE_709 = np.array([
-    [3.0, 2.3, 1.6],      # warm key light
-    [0.35, 0.55, 1.0],    # cool fill light
-    [0.10, 0.10, 0.10],   # ambient
-    [0.03, 0.03, 0.035],  # background
-], dtype=np.float32)
-
-
-def _unit(v: list[float]) -> np.ndarray:
-    a = np.asarray(v, dtype=np.float32)
-    return a / np.linalg.norm(a)
-
-
-L_KEY = _unit([-0.5, 0.6, 0.65])
-L_FILL = _unit([0.7, -0.1, 0.4])
-
 
 def _compile(kind: int, src: str) -> int:
     sh = gl.glCreateShader(kind)
@@ -410,7 +586,8 @@ def _compile(kind: int, src: str) -> int:
 
 
 class GLRenderer:
-    def __init__(self) -> None:
+    def __init__(self, d: SettingsData) -> None:
+        self.d = d
         fmt = QtGui.QSurfaceFormat()
         fmt.setVersion(3, 3)
         fmt.setProfile(QtGui.QSurfaceFormat.OpenGLContextProfile.CoreProfile)
@@ -436,8 +613,7 @@ class GLRenderer:
         self.stage_tex: dict[str, int] = {}
         self.tex_aspect = 1.0
         self.meshes: dict[tuple[str, float], tuple[int, int]] = {}  # key -> (vao, index count)
-        self.fbo: dict[str, int] = {}
-        self.fbo_size = (0, 0)
+        self.fbos: dict[tuple[int, int, int], dict[str, int]] = {}
 
     def make_current(self) -> None:
         self.ctx.makeCurrent(self.surface)
@@ -455,7 +631,7 @@ class GLRenderer:
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
         try:  # anisotropic filtering, if available
-            gl.glTexParameterf(gl.GL_TEXTURE_2D, 0x84FE, 8.0)
+            gl.glTexParameterf(gl.GL_TEXTURE_2D, 0x84FE, float(self.d.anisotropy))
         except Exception:  # noqa: BLE001
             pass
 
@@ -473,6 +649,17 @@ class GLRenderer:
         self._upload(tid, tex)
         return tid
 
+    def settings_changed(self, name: str) -> None:
+        self.make_current()
+        if name in ("msaa_samples", "*"):
+            for f in self.fbos.values():
+                self._free_fbo(f)
+            self.fbos.clear()
+        if name in ("mesh_detail", "*"):
+            for vao, _n in self.meshes.values():
+                gl.glDeleteVertexArrays(1, [vao])
+            self.meshes.clear()
+
     def meshes_to_free(self) -> None:
         for key in [k for k in self.meshes if k[0] == "Plane"]:
             gl.glDeleteVertexArrays(1, [self.meshes.pop(key)[0]])
@@ -480,9 +667,9 @@ class GLRenderer:
     # ---- meshes ----
     def _mesh(self, shape: str, aspect: float) -> tuple[int, int]:
         aspect = round(aspect, 3) if shape == "Plane" else 1.0
-        key = (shape, aspect)
+        key = (shape, aspect, self.d.mesh_detail)
         if key not in self.meshes:
-            verts, idx = MESH_BUILDERS[shape](aspect)
+            verts, idx = MESH_BUILDERS[shape](aspect, self.d.mesh_detail)
             vao = int(gl.glGenVertexArrays(1))
             gl.glBindVertexArray(vao)
             vbo, ebo = gl.glGenBuffers(2)
@@ -498,20 +685,21 @@ class GLRenderer:
             self.meshes[key] = (vao, len(idx))
         return self.meshes[key]
 
-    # ---- framebuffers ----
-    def _free_fbo(self) -> None:
+    # ---- framebuffers (a few sizes are cached: viewports and stage renders differ) ----
+    @staticmethod
+    def _free_fbo(f: dict[str, int]) -> None:
         for k in ("ms", "resolve"):
-            if k in self.fbo:
-                gl.glDeleteFramebuffers(1, [self.fbo[k]])
+            if k in f:
+                gl.glDeleteFramebuffers(1, [f[k]])
         for k in ("rb_color", "rb_depth"):
-            if k in self.fbo:
-                gl.glDeleteRenderbuffers(1, [self.fbo[k]])
-        if "tex" in self.fbo:
-            gl.glDeleteTextures(1, [self.fbo["tex"]])
-        self.fbo = {}
+            if k in f:
+                gl.glDeleteRenderbuffers(1, [f[k]])
+        if "tex" in f:
+            gl.glDeleteTextures(1, [f["tex"]])
+        f.clear()
 
-    def _create_fbo(self, w: int, h: int, samples: int) -> None:
-        f = self.fbo
+    @staticmethod
+    def _create_fbo(f: dict[str, int], w: int, h: int, samples: int) -> None:
         f["ms"] = int(gl.glGenFramebuffers(1))
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, f["ms"])
         for key, fmt, att in (("rb_color", gl.GL_RGBA32F, gl.GL_COLOR_ATTACHMENT0),
@@ -537,30 +725,34 @@ class GLRenderer:
         if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) != gl.GL_FRAMEBUFFER_COMPLETE:
             raise RuntimeError("resolve framebuffer incomplete")
 
-    def _ensure_fbo(self, w: int, h: int) -> None:
-        if self.fbo_size == (w, h) and self.fbo:
-            return
-        self._free_fbo()
-        for samples in (4, 0):
+    def _ensure_fbo(self, w: int, h: int) -> dict[str, int]:
+        key = (w, h, self.d.msaa_samples)
+        if key in self.fbos:
+            return self.fbos[key]
+        while len(self.fbos) >= 8:  # drop the oldest
+            self._free_fbo(self.fbos.pop(next(iter(self.fbos))))
+        last_err: Exception | None = None
+        for samples in dict.fromkeys((self.d.msaa_samples, 0)):
+            f: dict[str, int] = {}
             try:
-                self._create_fbo(w, h, samples)
-                break
-            except RuntimeError:
-                self._free_fbo()
-        else:
-            raise RuntimeError("Could not create a floating-point framebuffer")
-        self.fbo_size = (w, h)
+                self._create_fbo(f, w, h, samples)
+                self.fbos[key] = f
+                return f
+            except Exception as e:  # noqa: BLE001  (GLError or RuntimeError)
+                last_err = e
+                self._free_fbo(f)
+        raise RuntimeError(f"Could not create a floating-point framebuffer: {last_err}")
 
     # ---- draw ----
     def render(self, shape: str, cam: Camera, scene: np.ndarray, w: int, h: int,
                texture: int | None = None, aspect: float | None = None) -> np.ndarray:
         """Returns float32 RGB (top-down) in the working space that `scene` is expressed in."""
         self.make_current()
-        self._ensure_fbo(w, h)
+        fb = self._ensure_fbo(w, h)
         vao, count = self._mesh(shape, aspect or self.tex_aspect)
         key, fill, amb, bg = (np.asarray(c, dtype=np.float32) for c in scene)
 
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.fbo["ms"])
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fb["ms"])
         gl.glViewport(0, 0, w, h)
         gl.glClearColor(float(bg[0]), float(bg[1]), float(bg[2]), 1.0)
         gl.glEnable(gl.GL_DEPTH_TEST)
@@ -576,8 +768,9 @@ class GLRenderer:
         gl.glUniform3f(loc("uKey"), *map(float, key))
         gl.glUniform3f(loc("uFill"), *map(float, fill))
         gl.glUniform3f(loc("uAmb"), *map(float, amb))
-        gl.glUniform3f(loc("uLKey"), *map(float, L_KEY))
-        gl.glUniform3f(loc("uLFill"), *map(float, L_FILL))
+        gl.glUniform3f(loc("uLKey"), *map(float, unit_vector(self.d.key_dir)))
+        gl.glUniform3f(loc("uLFill"), *map(float, unit_vector(self.d.fill_dir)))
+        gl.glUniform2f(loc("uSpec"), float(self.d.spec_strength), float(self.d.spec_power))
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, texture or self.texture)
         gl.glUniform1i(loc("uTex"), 0)
@@ -585,10 +778,10 @@ class GLRenderer:
         gl.glDrawElements(gl.GL_TRIANGLES, count, gl.GL_UNSIGNED_INT, None)
         gl.glBindVertexArray(0)
 
-        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self.fbo["ms"])
-        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self.fbo["resolve"])
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, fb["ms"])
+        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, fb["resolve"])
         gl.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
-        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self.fbo["resolve"])
+        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, fb["resolve"])
         gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
         data = gl.glReadPixels(0, 0, w, h, gl.GL_RGB, gl.GL_FLOAT)
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
@@ -728,17 +921,17 @@ def fmt_rgb(a: np.ndarray) -> str:
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    THUMB = (240, 180)
-    THUMB_RENDER = (360, 270)  # size of the renders shown in the stage cards
     SHOW_MODES = ["Flat texture", "sRGB renderer", "ACEScg renderer"]
-    THUMB_SIZE = 256  # longest side of the image used for the pipeline thumbnails
+    STAGE_TITLES = {"in": "Input image", "ws": "Working space", "mx": "Input matrix", "view": "View transform"}
 
-    def __init__(self, ctx: OcioContext, renderer: GLRenderer) -> None:
+    def __init__(self, ctx: OcioContext, renderer: GLRenderer, settings: Settings) -> None:
         super().__init__()
         self.setWindowTitle("OCIO Pipeline Viewer")
         self.ctx = ctx
         self.gl = renderer
-        self.camera = Camera()
+        self.settings = settings
+        self.d = settings.d
+        self.camera = Camera(self.d)
         self.image: np.ndarray | None = None
         self.thumb: np.ndarray | None = None
         self.image_path = ""
@@ -746,16 +939,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_log: list[str] = []
         self.ocio_matrix = np.eye(3)
         self._fast = False
-        self.thumb_cam = Camera()  # fixed camera for the stage renders (not linked to the viewports)
+        self.thumb_cam = Camera(self.d)  # fixed camera for the stage renders (not linked to the viewports)
         self.show_combos: dict[str, QtWidgets.QComboBox] = {}
+        self.override_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self.override_key: str | None = None      # pipeline step shown in the renderers (None = final)
+        self.stages_full: Stages | None = None
+        self.thumb_labels: list[QtWidgets.QLabel] = []
+        self.setting_setters: dict[str, callable] = {}
+        self.scene_709 = scene_from_settings(self.d)
+        self.scene_acescg = self.scene_709
         self.caps_srgb: list[QtWidgets.QLabel] = []
         self.caps_acescg: list[QtWidgets.QLabel] = []
 
-        self.tex_timer = QtCore.QTimer(singleShot=True, interval=40)
+        self.tex_timer = QtCore.QTimer(singleShot=True, interval=self.d.texture_debounce_ms)
         self.tex_timer.timeout.connect(self.rebuild_texture)
         self.draw_timer = QtCore.QTimer(singleShot=True, interval=8)
         self.draw_timer.timeout.connect(lambda: self.redraw(self._fast))
-        self.refine_timer = QtCore.QTimer(singleShot=True, interval=200)
+        self.refine_timer = QtCore.QTimer(singleShot=True, interval=self.d.refine_delay_ms)
         self.refine_timer.timeout.connect(lambda: self.redraw(False))
         self.prev_timer = QtCore.QTimer(singleShot=True, interval=30)
         self.prev_timer.timeout.connect(self.update_previews)
@@ -764,6 +964,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.tabs)
         self.tabs.addTab(self._build_viewer_tab(), "Viewer")
         self.tabs.addTab(self._build_pipeline_tab(), "Pipeline")
+        self.tabs.addTab(self._build_settings_tab(), "Settings")
         self._wire()
         self.bind_context(ctx)
         self.resize(1400, 880)
@@ -813,10 +1014,18 @@ class MainWindow(QtWidgets.QMainWindow):
         l2.addWidget(note)
         left.addWidget(g2)
 
-        g3 = QtWidgets.QGroupBox("3 · Input matrix override (Rec.709 → ACEScg gamut step)")
-        l3 = QtWidgets.QVBoxLayout(g3)
+        g3 = QtWidgets.QGroupBox("3 · View transform")
+        l3 = QtWidgets.QFormLayout(g3)
+        self.cmb_view = QtWidgets.QComboBox()
+        self.lbl_display = QtWidgets.QLabel()
+        l3.addRow("Display:", self.lbl_display)
+        l3.addRow("View:", self.cmb_view)
+        left.addWidget(g3)
+
+        g4 = QtWidgets.QGroupBox("4 · Input matrix override (Rec.709 → ACEScg gamut step)")
+        l4 = QtWidgets.QVBoxLayout(g4)
         self.chk_matrix = QtWidgets.QCheckBox("Override OCIO gamut matrix")
-        l3.addWidget(self.chk_matrix)
+        l4.addWidget(self.chk_matrix)
         grid = QtWidgets.QGridLayout()
         self.spins: list[QtWidgets.QDoubleSpinBox] = []
         for i in range(9):
@@ -827,18 +1036,14 @@ class MainWindow(QtWidgets.QMainWindow):
             sb.valueChanged.connect(self.schedule_texture)
             grid.addWidget(sb, i // 3, i % 3)
             self.spins.append(sb)
-        l3.addLayout(grid)
+        l4.addLayout(grid)
         btn_reset = QtWidgets.QPushButton("Reset to OCIO matrix")
         btn_reset.clicked.connect(self.reset_matrix)
-        l3.addWidget(btn_reset)
-        left.addWidget(g3)
-
-        g4 = QtWidgets.QGroupBox("4 · View transform")
-        l4 = QtWidgets.QFormLayout(g4)
-        self.cmb_view = QtWidgets.QComboBox()
-        self.lbl_display = QtWidgets.QLabel()
-        l4.addRow("Display:", self.lbl_display)
-        l4.addRow("View:", self.cmb_view)
+        l4.addWidget(btn_reset)
+        btn_paste = QtWidgets.QPushButton("Insert matrix from clipboard")
+        btn_paste.setToolTip("Parses spaced columns (one row per line) or [[a, b, c], ...] with brackets and commas")
+        btn_paste.clicked.connect(self.paste_matrix)
+        l4.addWidget(btn_paste)
         left.addWidget(g4)
 
         btn_cfg = QtWidgets.QPushButton("Load OCIO config…")
@@ -874,7 +1079,8 @@ class MainWindow(QtWidgets.QMainWindow):
         box = QtWidgets.QGroupBox(title)
         v = QtWidgets.QVBoxLayout(box)
         thumb = QtWidgets.QLabel()
-        thumb.setFixedSize(*self.THUMB)
+        thumb.setFixedSize(self.d.thumb_width, self.d.thumb_height)
+        self.thumb_labels.append(thumb)
         thumb.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         thumb.setStyleSheet("background:#111; color:#666;")
         thumb.setText("no image")
@@ -887,6 +1093,11 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Show as:", combo)
         v.addLayout(form)
         self.show_combos[key] = combo
+        chk = QtWidgets.QCheckBox("Show this step in the renderers")
+        chk.setToolTip("Override: the two 3D renderers use this step's texture instead of the final one")
+        chk.toggled.connect(lambda checked, k=key: self.on_override(k, checked))
+        v.addWidget(chk)
+        self.override_checks[key] = chk
         return box, v, thumb
 
     @staticmethod
@@ -952,6 +1163,10 @@ class MainWindow(QtWidgets.QMainWindow):
         v3.addLayout(f3)
         self.info_mx = self._info_label(mono=True)
         v3.addWidget(self.info_mx)
+        btn_paste2 = QtWidgets.QPushButton("Insert matrix from clipboard")
+        btn_paste2.setToolTip("Parses spaced columns (one row per line) or [[a, b, c], ...] with brackets and commas")
+        btn_paste2.clicked.connect(self.paste_matrix)
+        v3.addWidget(btn_paste2)
         btn_edit = QtWidgets.QPushButton("Edit matrix values…")
         btn_edit.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
         v3.addWidget(btn_edit)
@@ -975,7 +1190,7 @@ class MainWindow(QtWidgets.QMainWindow):
             chain.addWidget(c, 1)
 
         # 5 · Renderers
-        c5 = QtWidgets.QGroupBox("5 · Renderers  (final texture → primitive → view transform)")
+        self.box_render = c5 = QtWidgets.QGroupBox()
         v5 = QtWidgets.QVBoxLayout(c5)
         r5 = QtWidgets.QHBoxLayout()
         r5.addWidget(QtWidgets.QLabel("Primitive:"))
@@ -1014,6 +1229,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_preview.currentIndexChanged.connect(lambda _=0: self.request_previews())
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.camera.changed.connect(lambda: self.request_redraw(fast=True))
+        self.settings.changed.connect(self.on_settings_changed)
 
     @staticmethod
     def _link_combo_check(combo: QtWidgets.QComboBox, chk: QtWidgets.QCheckBox, checked_index: int) -> None:
@@ -1036,6 +1252,177 @@ class MainWindow(QtWidgets.QMainWindow):
         a.currentTextChanged.connect(lambda t: b.setCurrentText(t) if b.currentText() != t else None)
         b.currentTextChanged.connect(lambda t: a.setCurrentText(t) if a.currentText() != t else None)
 
+    # ------------------------------------------------------ Settings tab --
+    def _build_settings_tab(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(page)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel("Changes apply immediately and are saved between sessions."))
+        top.addStretch(1)
+        btn = QtWidgets.QPushButton("Reset all to defaults")
+        btn.clicked.connect(self.settings.reset)
+        top.addWidget(btn)
+        outer.addLayout(top)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QtWidgets.QWidget()
+        col = QtWidgets.QVBoxLayout(inner)
+        for title, items in SETTING_GROUPS:
+            box = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QFormLayout(box)
+            for name, label, kind, lo, hi, step, tip in items:
+                w = self._make_setting_widget(name, kind, lo, hi, step)
+                if tip:
+                    w.setToolTip(tip)
+                form.addRow(label + ":", w)
+            col.addWidget(box)
+        col.addStretch(1)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+        return page
+
+    def _make_setting_widget(self, name: str, kind: str, lo: float, hi: float, step: float) -> QtWidgets.QWidget:
+        value = getattr(self.d, name)
+        put = lambda v: self.settings.set(name, v)  # noqa: E731
+
+        def dspin() -> QtWidgets.QDoubleSpinBox:
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setSingleStep(step)
+            sb.setDecimals(4 if step < 0.01 else 3)
+            return sb
+
+        if kind == "int":
+            w = QtWidgets.QSpinBox()
+            w.setRange(int(lo), int(hi))
+            w.setSingleStep(int(step))
+            w.setValue(int(value))
+            w.valueChanged.connect(lambda v: put(int(v)))
+            self.setting_setters[name] = lambda v, w=w: (w.blockSignals(True), w.setValue(int(v)), w.blockSignals(False))
+        elif kind == "float":
+            w = dspin()
+            w.setValue(float(value))
+            w.valueChanged.connect(lambda v: put(float(v)))
+            self.setting_setters[name] = lambda v, w=w: (w.blockSignals(True), w.setValue(float(v)), w.blockSignals(False))
+        elif kind == "vec3":
+            w = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            sbs = [dspin() for _ in range(3)]
+            for sb, v in zip(sbs, value):
+                sb.setValue(float(v))
+                h.addWidget(sb)
+                sb.valueChanged.connect(lambda _=0: put(tuple(x.value() for x in sbs)))
+
+            def set_vec(v, sbs=sbs) -> None:
+                for sb, x in zip(sbs, v):
+                    sb.blockSignals(True)
+                    sb.setValue(float(x))
+                    sb.blockSignals(False)
+            self.setting_setters[name] = set_vec
+        elif kind == "bool":
+            w = QtWidgets.QCheckBox()
+            w.setChecked(bool(value))
+            w.toggled.connect(lambda v: put(bool(v)))
+            self.setting_setters[name] = lambda v, w=w: (w.blockSignals(True), w.setChecked(bool(v)), w.blockSignals(False))
+        elif kind == "str":
+            w = QtWidgets.QLineEdit(str(value))
+            w.editingFinished.connect(lambda w=w: put(w.text().strip()))
+            self.setting_setters[name] = lambda v, w=w: w.setText(str(v))
+        elif kind.startswith("choice:"):
+            opts = kind.split(":", 1)[1].split(",")
+            w = QtWidgets.QComboBox()
+            w.addItems(opts)
+            w.setCurrentText(str(value))
+            w.currentTextChanged.connect(lambda t: put(int(t)))
+            self.setting_setters[name] = lambda v, w=w: (w.blockSignals(True), w.setCurrentText(str(v)), w.blockSignals(False))
+        else:  # pragma: no cover
+            raise ValueError(kind)
+        return w
+
+    def on_settings_changed(self, name: str) -> None:
+        d = self.d
+        if name == "*":  # full reset: refresh every widget
+            for n, setter in self.setting_setters.items():
+                setter(getattr(d, n))
+        self.tex_timer.setInterval(d.texture_debounce_ms)
+        self.refine_timer.setInterval(d.refine_delay_ms)
+        self.thumb_cam.reset(emit=False)
+        for lb in self.thumb_labels:
+            lb.setFixedSize(d.thumb_width, d.thumb_height)
+        if name in ("thumb_source_size", "*") and self.image is not None:
+            self.thumb = box_downscale(self.image, d.thumb_source_size)
+        self.scene_709 = scene_from_settings(d)
+        self.scene_acescg = self.ctx.convert(self.scene_709.reshape(1, 4, 3), self.ctx.lin709,
+                                             self.ctx.acescg).reshape(4, 3)
+        self.gl.settings_changed(name)
+        if name in ("anisotropy", "*") and self.tex is not None:
+            self.gl.set_texture(self.tex)  # re-upload with the new filtering
+        self.request_redraw()
+        self.request_previews()
+
+    # -------------------------------------------- matrix paste (clipboard) --
+    def paste_matrix(self) -> None:
+        text = QtWidgets.QApplication.clipboard().text()
+        try:
+            m = parse_matrix(text, column_major=self.d.paste_column_major)
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Insert matrix",
+                f"{e}\n\nSupported: spaced columns with one row per line, or brackets and commas, e.g.\n"
+                "0.6 0.3 0.1\n0.1 0.8 0.1\n0.05 0.1 0.85\n\n[[0.6, 0.3, 0.1], [0.1, 0.8, 0.1], [0.05, 0.1, 0.85]]")
+            return
+        for sb, val in zip(self.spins, m.flatten()):
+            sb.blockSignals(True)
+            sb.setValue(float(val))
+            sb.blockSignals(False)
+        self.chk_convert.setChecked(True)   # the matrix only takes effect when converting
+        self.chk_matrix.setChecked(True)
+        self._sync_enabled()
+        self.schedule_texture()
+        self.request_previews()
+        rows = "; ".join(" ".join(f"{v:g}" for v in r) for r in m)
+        self.statusBar().showMessage(f"Matrix inserted from clipboard: {rows}", 8000)
+
+    # ------------------------------------ "show this step in the renderers" --
+    def on_override(self, key: str, checked: bool) -> None:
+        if checked:
+            for k, chk in self.override_checks.items():  # exclusive
+                if k != key and chk.isChecked():
+                    chk.blockSignals(True)
+                    chk.setChecked(False)
+                    chk.blockSignals(False)
+            self.override_key = key
+        elif self.override_key == key:
+            self.override_key = None
+        self.apply_render_texture()
+
+    def render_texture_array(self) -> np.ndarray | None:
+        st = self.stages_full
+        if st is None:
+            return None
+        pick = {"in": st.inp, "ws": st.ws, "mx": st.mx, "view": st.mx}
+        return np.nan_to_num(pick.get(self.override_key or "mx", st.mx))
+
+    def apply_render_texture(self) -> None:
+        arr = self.render_texture_array()
+        if arr is not None:
+            self.tex = arr
+            self.gl.set_texture(arr)
+        self.update_captions()
+        self.redraw(False)
+
+    def update_captions(self) -> None:
+        ctx = self.ctx
+        suffix = f"  ·  step: {self.STAGE_TITLES[self.override_key]}" if self.override_key else ""
+        for cap in self.caps_srgb:
+            cap.setText(f"sRGB renderer  ({ctx.lin709}){suffix}")
+        for cap in self.caps_acescg:
+            cap.setText(f"ACEScg renderer  ({ctx.acescg}){suffix}")
+        src = f"step '{self.STAGE_TITLES[self.override_key]}'" if self.override_key else "final texture"
+        self.box_render.setTitle(f"5 · Renderers  ({src} → primitive → view transform)")
+
     def on_tab_changed(self, _i: int) -> None:
         self.request_redraw()
         self.request_previews()
@@ -1044,7 +1431,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def bind_context(self, ctx: OcioContext) -> None:
         self.ctx = ctx
         self.ocio_matrix = ctx.gamut_matrix()
-        self.scene_acescg = ctx.convert(SCENE_709.reshape(1, 4, 3), ctx.lin709, ctx.acescg).reshape(4, 3)
+        self.scene_709 = scene_from_settings(self.d)
+        self.scene_acescg = ctx.convert(self.scene_709.reshape(1, 4, 3), ctx.lin709, ctx.acescg).reshape(4, 3)
         for cb in (self.cmb_view, self.cmb_view2):
             cb.blockSignals(True)
             cb.clear()
@@ -1054,10 +1442,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for lb in (self.lbl_display, self.lbl_display2):
             lb.setText(ctx.display)
         self.lbl_cfg.setText(f"Config: {ctx.config.getName() or ctx.config.getDescription()[:60]}")
-        for cap in self.caps_srgb:
-            cap.setText(f"sRGB renderer  ({ctx.lin709})")
-        for cap in self.caps_acescg:
-            cap.setText(f"ACEScg renderer  ({ctx.acescg})")
+        self.update_captions()
         self.reset_matrix()
         self._sync_enabled()
         self.schedule_texture()
@@ -1095,12 +1480,12 @@ class MainWindow(QtWidgets.QMainWindow):
     # ----------------------------------------------------------- loading --
     def load_path(self, path: str) -> None:
         try:
-            arr, is_float = load_image(path)
+            arr, is_float = load_image(path, self.d.max_texture_size)
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Load error", str(e))
             return
         self.image, self.image_path = arr, path
-        self.thumb = box_downscale(arr, self.THUMB_SIZE)
+        self.thumb = box_downscale(arr, self.d.thumb_source_size)
         self.chk_srgb.setChecked(not is_float)  # EXR/HDR are normally linear
         prev = np.clip(arr, 0, 1)
         if is_float:
@@ -1141,8 +1526,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             is_srgb, conv, override = self._params()
             st = run_pipeline(self.ctx, self.image, is_srgb, conv, override, self.matrix())
-            self.tex = np.nan_to_num(st.mx)
-            self.pipeline_log = self.describe_pipeline() + [f"Final texture {fmt_rgb(self.tex)}"]
+            self.stages_full = st
+            self.pipeline_log = self.describe_pipeline() + [f"Final texture {fmt_rgb(st.mx)}"]
+            self.tex = self.render_texture_array()   # final texture, or the step chosen for override
             self.gl.set_texture(self.tex)
         except Exception as e:  # noqa: BLE001
             self.pipeline_log = [f"ERROR: {e}"]
@@ -1151,9 +1537,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.request_previews()
 
     # ------------------------------------- rendering (GPU + OCIO display) --
-    def active_viewports(self) -> tuple[ViewportWidget, ViewportWidget]:
-        return (self.view_srgb, self.view_acescg) if self.tabs.currentIndex() == 0 \
-            else (self.pipe_srgb, self.pipe_acescg)
+    def active_viewports(self) -> tuple[ViewportWidget, ViewportWidget] | None:
+        i = self.tabs.currentIndex()
+        if i == 0:
+            return self.view_srgb, self.view_acescg
+        if i == 1:
+            return self.pipe_srgb, self.pipe_acescg
+        return None  # Settings tab: nothing to draw
 
     def request_redraw(self, fast: bool = False) -> None:
         self._fast = self._fast or fast
@@ -1167,11 +1557,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.tex is None:
             return
         ctx, view, shape = self.ctx, self.cmb_view.currentText(), self.cmb_shape.currentText()
-        vp_a, vp_b = self.active_viewports()
+        active = self.active_viewports()
+        if active is None:
+            return
+        vp_a, vp_b = active
         try:
-            for ws, scene, vp in ((ctx.lin709, SCENE_709, vp_a), (ctx.acescg, self.scene_acescg, vp_b)):
+            for ws, scene, vp in ((ctx.lin709, self.scene_709, vp_a), (ctx.acescg, self.scene_acescg, vp_b)):
                 W, H = vp.pixel_size()
-                s = min(1.0, MAX_RENDER_SIZE / max(W, H)) * (0.5 if fast else 1.0)
+                s = min(1.0, self.d.max_render_size / max(W, H)) * (self.d.interactive_scale if fast else 1.0)
                 w, h = max(16, int(W * s)), max(16, int(H * s))
                 lin = self.gl.render(shape, self.camera, scene, w, h)
                 disp = ctx.to_display(np.maximum(lin, 0.0), ws, view)
@@ -1182,7 +1575,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def update_log(self) -> None:
         if not self.pipeline_log or self.image is None:
             return
-        extra = [f"Shape  : {self.cmb_shape.currentText()}   (GPU: {self.gl.info})",
+        shown = f"step '{self.STAGE_TITLES[self.override_key]}' (override)" if self.override_key else "final texture"
+        extra = [f"Renderers show: {shown}",
+                 f"Shape  : {self.cmb_shape.currentText()}   (GPU: {self.gl.info})",
                  f"View   : working space -> display '{self.ctx.display}' / view '{self.cmb_view.currentText()}'",
                  "Both viewports use the SAME texture numbers and the SAME lights "
                  "(lights converted to each working space)."]
@@ -1219,9 +1614,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         disp = arr
                 else:  # render this stage's texture on the primitive with the chosen renderer
-                    ws, scene = (ctx.lin709, SCENE_709) if mode == 1 else (ctx.acescg, self.scene_acescg)
+                    ws, scene = (ctx.lin709, self.scene_709) if mode == 1 else (ctx.acescg, self.scene_acescg)
                     tid = self.gl.set_stage_texture(key, arr)
-                    tw, th = self.THUMB_RENDER
+                    tw, th = self.d.thumb_render_width, self.d.thumb_render_height
                     lin = self.gl.render(shape, self.thumb_cam, scene, tw, th, texture=tid,
                                          aspect=arr.shape[1] / arr.shape[0])
                     disp = ctx.to_display(np.maximum(lin, 0), ws, view)
@@ -1252,23 +1647,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
-    
+    app.setOrganizationName("OCIOPipelineViewer")
+    settings = Settings()
     try:
-        cfg = OCIO.Config.CreateFromEnv() if os.environ.get("OCIO") else OCIO.Config.CreateFromFile(DEFAULT_CONFIG)
+        cfg = OCIO.Config.CreateFromEnv() if os.environ.get("OCIO") \
+            else OCIO.Config.CreateFromFile(settings.d.default_config)
         ctx = OcioContext(cfg)
     except Exception as e:  # noqa: BLE001
         QtWidgets.QMessageBox.critical(None, "OCIO error", f"Could not initialise OCIO config:\n{e}")
         return 1
-    
     try:
-        renderer = GLRenderer()
+        renderer = GLRenderer(settings.d)
     except Exception as e:  # noqa: BLE001
         QtWidgets.QMessageBox.critical(None, "OpenGL error", f"Could not initialise OpenGL 3.3:\n{e}")
         return 1
-
-    win = MainWindow(ctx, renderer)
+    win = MainWindow(ctx, renderer, settings)
     win.show()
-    
     return app.exec()
 
 
