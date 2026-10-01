@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
 """
+OCIO Pipeline Viewer
+
 How rendering works: OpenGL shades in floating point in the renderer's working space
 (MSAA float framebuffer), the result is read back and OCIO applies the selected
 display/view transform on the CPU. While you drag, it renders at half resolution and
 refines to full resolution when you stop.
 
+View-transform override: the Viewer tab has an HLSL editor. When "Override" is ticked the
+shader replaces the OCIO view transform in every rendered preview. Contract:
+    float3 ViewTransform(float3 color, float3x3 inputMatrix)
+HLSL is translated to GLSL 3.30 and compiled on the GPU (errors keep your line numbers).
+"Reset to default" restores the built-in shader.
+
+Colour spaces: the input space and the working space are picked from cascading menus built from the
+loaded OCIO config: Roles, then the Family tree ("Input/Camera" -> Input > Camera), then
+Categories, separated by lines. The conversion is the OCIO transform between the two spaces.
+
+Settings: saved as ocio_pipeline_viewer_settings.json next to the .exe (or the script); if that
+folder is read-only, in the user's config folder. A custom start-up OCIO config that fails to load
+is reset to the built-in config. Relative config paths are relative to the .exe folder.
 """
 from __future__ import annotations
 
@@ -26,12 +41,52 @@ from PIL import Image
 from PySide6 import QtCore, QtGui, QtWidgets
 
 
+BUILTIN_CONFIG = "ocio://cg-config-latest"      # built-in config (OCIO >= 2.3)
+SETTINGS_FILENAME = "ocio_pipeline_viewer_settings.json"
+NO_CONVERSION = "None (values as-is)"
+
+
+def app_dir() -> Path:
+    """Folder of the .exe when frozen/compiled (PyInstaller, Nuitka, ...), else of this script."""
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return Path(sys.argv[0]).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resolve_config_ref(ref: str) -> str:
+    """`ocio://...` URIs are kept; relative file paths are relative to the .exe folder."""
+    ref = ref.strip()
+    if ref.startswith("ocio://"):
+        return ref
+    p = Path(os.path.expandvars(ref)).expanduser()
+    return str(p if p.is_absolute() else app_dir() / p)
+
+
+def portable_ref(path: str) -> str:
+    """Store a config path relative to the .exe folder when possible (keeps the install portable)."""
+    if path.startswith("ocio://"):
+        return path
+    try:
+        return os.path.relpath(path, app_dir())
+    except ValueError:  # different drive on Windows
+        return path
+
+
+def default_settings_path() -> Path:
+    """Settings live next to the .exe; if that folder is read-only, in the user's config folder."""
+    if os.access(app_dir(), os.W_OK):
+        return app_dir() / SETTINGS_FILENAME
+    base = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.StandardLocation.AppConfigLocation)
+    folder = Path(base) if base else Path.home()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / SETTINGS_FILENAME
+
+
 # Candidate colour-space names/aliases across the built-in ACES CG/Studio configs
 CS_SRGB_TEXTURE = ["sRGB - Texture", "srgb_tx", "sRGB Encoded Rec.709 (sRGB)", "Utility - sRGB - Texture"]
 CS_LIN_709 = ["Linear Rec.709 (sRGB)", "lin_rec709_srgb", "scene-linear Rec.709-sRGB", "Utility - Linear - sRGB"]
 CS_ACESCG = ["ACEScg", "ACES - ACEScg", "acescg"]
 DISPLAY_CANDIDATES = ["sRGB - Display", "sRGB"]
-
 
 # --------------------------------------------------------------------------- #
 # OCIO helper
@@ -42,6 +97,35 @@ class OcioContext:
         self.srgb_tex = self._find_cs(CS_SRGB_TEXTURE, "sRGB texture")
         self.lin709 = self._find_cs(CS_LIN_709, "Linear Rec.709")
         self.acescg = self._find_cs(CS_ACESCG, "ACEScg")
+        # (name, family, categories) for every colour space in the config -> drives the tree pickers
+        self.cs_meta: list[tuple[str, str, list[str]]] = []
+        for cs in config.getColorSpaces():
+            self.cs_meta.append((cs.getName(), cs.getFamily() or "", [str(c) for c in cs.getCategories()]))
+        for required in (self.srgb_tex, self.lin709, self.acescg):
+            if required not in {m[0] for m in self.cs_meta}:
+                cs = config.getColorSpace(required)
+                self.cs_meta.append((required, cs.getFamily() or "", [str(c) for c in cs.getCategories()]))
+        self.colorspaces = [m[0] for m in self.cs_meta]
+
+        self.family_sep = "/"
+        try:
+            sep = config.getFamilySeparator()
+            if sep and ord(sep[0]) > 0:
+                self.family_sep = sep[0]
+        except Exception:  # noqa: BLE001
+            pass
+
+        self.roles: list[tuple[str, str]] = []   # (role, colour space name)
+        try:
+            known = set(self.colorspaces)
+            for item in config.getRoles():
+                role, name = item if isinstance(item, (tuple, list)) else (item, config.getRoleColorSpace(item))
+                if name in known:
+                    self.roles.append((str(role), str(name)))
+        except Exception:  # noqa: BLE001
+            pass
+        self.roles.sort(key=lambda r: r[0].lower())
+        self.source = ""  # where the config was loaded from (for display)
 
         displays = list(config.getDisplays())
         self.display = next((d for d in DISPLAY_CANDIDATES if d in displays), None) \
@@ -79,11 +163,16 @@ class OcioContext:
             self._display_cpu[(src, view)] = cpu
         return self._apply(cpu, arr)
 
-    def gamut_matrix(self) -> np.ndarray:
-        """3x3 matrix Linear Rec.709 -> ACEScg as OCIO computes it (row-major, out = M @ rgb)."""
+    def linear_matrix(self, src: str, dst: str) -> np.ndarray:
+        """3x3 matrix src -> dst as OCIO computes it (out = M @ rgb). Exact for linear colour spaces;
+        for non-linear ones it is only the linearised approximation."""
         basis = np.eye(3, dtype=np.float32).reshape(1, 3, 3)  # three RGB pixels
-        cols = self.convert(basis, self.lin709, self.acescg).reshape(3, 3)  # row i = M @ e_i
+        cols = self.convert(basis, src, dst).reshape(3, 3)    # row i = M @ e_i
         return cols.T.astype(np.float64)
+
+    def gamut_matrix(self, target: str | None = None) -> np.ndarray:
+        """Linear Rec.709 -> `target` (default ACEScg)."""
+        return self.linear_matrix(self.lin709, target or self.acescg)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,8 +256,50 @@ def to_qimage(u8: np.ndarray) -> QtGui.QImage:
     return QtGui.QImage(u8.data, w, h, 3 * w, QtGui.QImage.Format.Format_RGB888).copy()
 
 
+DEFAULT_VIEW_SHADER = """// ---- Custom view transform (HLSL) -------------------------------------------------
+// Replaces the OCIO view transform in all previews while "Override with custom
+// shader" is ticked. Runs per pixel on the rendered image, in the renderer's
+// working space.
+//
+//   color             linear scene RGB in the renderer's working space
+//                     (Linear Rec.709 for the sRGB renderer, ACEScg for the ACEScg one)
+//   inputMatrix       the matrix of step 3 (your custom values, else the OCIO default).
+//                     Row-major like HLSL:  mul(inputMatrix, color)
+//   workingToRec709   global float3x3: working-space primaries -> Rec.709 primaries
+//   returns           display-referred, sRGB-encoded RGB (0..1)
+//
+// Supported: float / float2 / float3 / float4, float3x3, float4x4, mul, saturate,
+// lerp, frac, fmod, mad, rsqrt, atan2, log10, ddx/ddy, static, #define / #if.
+// Not supported: implicit scalar -> vector promotion (write float3(0.5), not 0.5).
+
+#define USE_INPUT_MATRIX 0      // 1 = multiply the colour by inputMatrix first
+#define TONEMAP          0      // 1 = simple Reinhard tone-map
+
+float3 SrgbOetf(float3 c)
+{
+    float3 lo = c * 12.92;
+    float3 hi = 1.055 * pow(c, float3(1.0 / 2.4)) - 0.055;
+    return lerp(hi, lo, step(c, float3(0.0031308)));
+}
+
+float3 ViewTransform(float3 color, float3x3 inputMatrix)
+{
+    float3 c = max(color, float3(0.0));
+#if USE_INPUT_MATRIX
+    c = mul(inputMatrix, c);
+#endif
+    c = mul(workingToRec709, c);            // to the display primaries
+    c = max(c, float3(0.0));
+#if TONEMAP
+    c = c / (1.0 + c);
+#endif
+    return SrgbOetf(saturate(c));
+}
+"""
+
+
 # --------------------------------------------------------------------------- #
-# Settings (all tunable "magic numbers"; edited in the Settings tab, saved with QSettings)
+# Settings (all tunable "magic numbers"; edited in the Settings tab, saved as JSON next to the .exe)
 # --------------------------------------------------------------------------- #
 @dataclass
 class SettingsData:
@@ -205,7 +336,8 @@ class SettingsData:
     # behaviour
     texture_debounce_ms: int = 40
     paste_column_major: bool = False
-    default_config: str = "ocio://cg-config-latest"
+    default_config: str = BUILTIN_CONFIG
+    view_shader: str = DEFAULT_VIEW_SHADER   # edited in the Viewer tab, not listed in the Settings tab
 
 
 # (group title, [(field, label, kind, min, max, step, tooltip)])   kind: int|float|vec3|bool|str|choice:a,b,c
@@ -258,25 +390,29 @@ SETTING_GROUPS = [
         ("paste_column_major", "Pasted matrices are column-major", "bool", 0, 0, 0,
          "If on, a pasted matrix is transposed after parsing."),
         ("default_config", "Default OCIO config - applies on next start", "str", 0, 0, 0,
-         "Used when $OCIO is not set. Example: ocio://cg-config-latest or a path to a .ocio file."),
+         "Used when $OCIO is not set. ocio://... or a .ocio path (relative paths are relative to the .exe). "
+         "If it fails to load, it is reset to the built-in config."),
     ]),
 ]
 
 
 class Settings(QtCore.QObject):
-    """Holds SettingsData (`.d`, a stable object edited in place) and persists it as JSON."""
+    """Holds SettingsData (`.d`, a stable object edited in place) and persists it as a JSON file."""
     changed = QtCore.Signal(str)  # field name, or "*" for a full reset
 
-    def __init__(self) -> None:
+    def __init__(self, path: Path | None = None) -> None:
         super().__init__()
         self.d = SettingsData()
-        self._store = QtCore.QSettings("OCIOPipelineViewer", "OCIOPipelineViewer")
+        self.path = Path(path) if path else default_settings_path()
+        self.save_error = ""
         self.load()
 
     def load(self) -> None:
         try:
-            raw = json.loads(str(self._store.value("settings_json", "") or "{}"))
-        except (ValueError, TypeError):
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+        except (OSError, ValueError):
             return
         for f in fields(SettingsData):
             if f.name not in raw:
@@ -296,7 +432,13 @@ class Settings(QtCore.QObject):
             setattr(self.d, f.name, v)
 
     def save(self) -> None:
-        self._store.setValue("settings_json", json.dumps(asdict(self.d)))
+        tmp = self.path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(asdict(self.d), indent=2), encoding="utf-8")
+            os.replace(tmp, self.path)  # atomic: never leaves a half-written file
+            self.save_error = ""
+        except OSError as e:
+            self.save_error = f"Could not save settings to {self.path}: {e}"
 
     def set(self, name: str, value) -> None:
         setattr(self.d, name, value)
@@ -576,13 +718,110 @@ void main() {
 }
 """
 
+def _text(value) -> str:
+    """PyOpenGL returns GL strings / info logs as bytes or str depending on version and platform."""
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode(errors="replace")
+    return str(value)
+
+
 def _compile(kind: int, src: str) -> int:
     sh = gl.glCreateShader(kind)
     gl.glShaderSource(sh, src)
     gl.glCompileShader(sh)
     if not gl.glGetShaderiv(sh, gl.GL_COMPILE_STATUS):
-        raise RuntimeError("Shader compile error:\n" + gl.glGetShaderInfoLog(sh).decode(errors="replace"))
+        raise RuntimeError("Shader compile error:\n" + _text(gl.glGetShaderInfoLog(sh)))
     return sh
+
+
+# --------------------------------------------------------------------------- #
+# HLSL-flavoured post shader (custom view transform)
+#   HLSL source -> GLSL 3.30: types/intrinsics via macros + overloads, so line numbers in compiler
+#   messages match the editor. Matrices are uploaded with HLSL semantics: GLSL M[i] is HLSL row i,
+#   so mul(M, v) == M @ v in numpy.
+# --------------------------------------------------------------------------- #
+POST_VERT_SRC = """
+#version 330 core
+out vec2 vUV;
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    vUV = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+HLSL_PRELUDE = """
+#define float2 vec2
+#define float3 vec3
+#define float4 vec4
+#define half float
+#define half2 vec2
+#define half3 vec3
+#define half4 vec4
+#define int2 ivec2
+#define int3 ivec3
+#define int4 ivec4
+#define bool2 bvec2
+#define bool3 bvec3
+#define bool4 bvec4
+#define float2x2 mat2
+#define float3x3 mat3
+#define float4x4 mat4
+#define static
+#define lerp mix
+#define frac fract
+#define rsqrt inversesqrt
+#define atan2 atan
+#define ddx dFdx
+#define ddy dFdy
+float saturate(float x) { return clamp(x, 0.0, 1.0); }
+vec2 saturate(vec2 x) { return clamp(x, 0.0, 1.0); }
+vec3 saturate(vec3 x) { return clamp(x, 0.0, 1.0); }
+vec4 saturate(vec4 x) { return clamp(x, 0.0, 1.0); }
+float mad(float a, float b, float c) { return a * b + c; }
+vec3 mad(vec3 a, vec3 b, vec3 c) { return a * b + c; }
+float fmod(float x, float y) { return x - y * trunc(x / y); }
+vec3 fmod(vec3 x, vec3 y) { return x - y * trunc(x / y); }
+float log10(float x) { return log(x) * 0.43429448190325176; }
+vec3 log10(vec3 x) { return log(x) * 0.43429448190325176; }
+vec2 pow(vec2 x, float y) { return pow(x, vec2(y)); }
+vec3 pow(vec3 x, float y) { return pow(x, vec3(y)); }
+vec4 pow(vec4 x, float y) { return pow(x, vec4(y)); }
+vec3 mul(mat3 m, vec3 v) { return v * m; }
+vec3 mul(vec3 v, mat3 m) { return m * v; }
+mat3 mul(mat3 a, mat3 b) { return b * a; }
+vec4 mul(mat4 m, vec4 v) { return v * m; }
+vec4 mul(vec4 v, mat4 m) { return m * v; }
+mat4 mul(mat4 a, mat4 b) { return b * a; }
+vec2 mul(mat2 m, vec2 v) { return v * m; }
+vec2 mul(vec2 v, mat2 m) { return m * v; }
+"""
+
+
+def hlsl_to_glsl(src: str) -> str:
+    """Light source fix-ups (keeps the number of lines unchanged)."""
+    return re.sub(r"\[\s*(?:unroll|loop|branch|flatten|fastopt|allow_uav_condition)[^\]]*\]", "", src)
+
+
+def build_post_fragment(user_src: str) -> str:
+    return "\n".join([
+        "#version 330 core",
+        HLSL_PRELUDE,
+        "uniform sampler2D uImage;",
+        "uniform mat3 uInputMatrix;",
+        "uniform mat3 workingToRec709;",
+        "in vec2 vUV;",
+        "out vec4 outColor;",
+        "#line 1",
+        hlsl_to_glsl(user_src),
+        "",
+        "void main() {",
+        "    vec3 c = texture(uImage, vUV).rgb;",
+        "    outColor = vec4(ViewTransform(c, uInputMatrix), 1.0);",
+        "}",
+    ])
 
 
 class GLRenderer:
@@ -600,17 +839,23 @@ class GLRenderer:
         self.surface.create()
         self.make_current()
 
-        self.info = (gl.glGetString(gl.GL_RENDERER) or b"?").decode(errors="replace")
+        self.info = _text(gl.glGetString(gl.GL_RENDERER)) or "?"
         vs, fs = _compile(gl.GL_VERTEX_SHADER, VERT_SRC), _compile(gl.GL_FRAGMENT_SHADER, FRAG_SRC)
         self.prog = gl.glCreateProgram()
         gl.glAttachShader(self.prog, vs)
         gl.glAttachShader(self.prog, fs)
         gl.glLinkProgram(self.prog)
         if not gl.glGetProgramiv(self.prog, gl.GL_LINK_STATUS):
-            raise RuntimeError("Program link error:\n" + gl.glGetProgramInfoLog(self.prog).decode(errors="replace"))
+            raise RuntimeError("Program link error:\n" + _text(gl.glGetProgramInfoLog(self.prog)))
 
         self.texture = int(gl.glGenTextures(1))
         self.stage_tex: dict[str, int] = {}
+        # custom view-transform (post) pass
+        self._post_vs = _compile(gl.GL_VERTEX_SHADER, POST_VERT_SRC)
+        self.post_prog = 0
+        self.post_fbos: dict[tuple[int, int], dict[str, int]] = {}
+        self.empty_vao = int(gl.glGenVertexArrays(1))
+        self.flat_tex = int(gl.glGenTextures(1))
         self.tex_aspect = 1.0
         self.meshes: dict[tuple[str, float], tuple[int, int]] = {}  # key -> (vao, index count)
         self.fbos: dict[tuple[int, int, int], dict[str, int]] = {}
@@ -743,10 +988,103 @@ class GLRenderer:
                 self._free_fbo(f)
         raise RuntimeError(f"Could not create a floating-point framebuffer: {last_err}")
 
+    # ---- custom view-transform shader ----
+    def compile_post(self, user_src: str) -> tuple[bool, str]:
+        """Compile the HLSL view-transform source. The previous program is kept until a new one links."""
+        self.make_current()
+        try:
+            fs = _compile(gl.GL_FRAGMENT_SHADER, build_post_fragment(user_src))
+        except RuntimeError as e:
+            return False, str(e).replace("Shader compile error:\n", "")
+        prog = gl.glCreateProgram()
+        gl.glAttachShader(prog, self._post_vs)
+        gl.glAttachShader(prog, fs)
+        gl.glLinkProgram(prog)
+        ok = bool(gl.glGetProgramiv(prog, gl.GL_LINK_STATUS))
+        log = _text(gl.glGetProgramInfoLog(prog))
+        gl.glDeleteShader(fs)
+        if not ok:
+            gl.glDeleteProgram(prog)
+            return False, "Link error:\n" + log
+        if self.post_prog:
+            gl.glDeleteProgram(self.post_prog)
+        self.post_prog = prog
+        return True, log
+
+    def _ensure_post_fbo(self, w: int, h: int) -> dict[str, int]:
+        key = (w, h)
+        if key in self.post_fbos:
+            return self.post_fbos[key]
+        while len(self.post_fbos) >= 8:
+            old = self.post_fbos.pop(next(iter(self.post_fbos)))
+            gl.glDeleteFramebuffers(1, [old["fbo"]])
+            gl.glDeleteTextures(1, [old["tex"]])
+        tex = int(gl.glGenTextures(1))
+        gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA32F, w, h, 0, gl.GL_RGBA, gl.GL_FLOAT, None)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+        fbo = int(gl.glGenFramebuffers(1))
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
+        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, tex, 0)
+        if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) != gl.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError("post-pass framebuffer incomplete")
+        self.post_fbos[key] = {"fbo": fbo, "tex": tex}
+        return self.post_fbos[key]
+
+    @staticmethod
+    def _read_rgb(w: int, h: int) -> np.ndarray:
+        gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
+        data = gl.glReadPixels(0, 0, w, h, gl.GL_RGB, gl.GL_FLOAT)
+        arr = np.frombuffer(data, dtype=np.float32) if isinstance(data, (bytes, bytearray)) \
+            else np.asarray(data, dtype=np.float32)
+        return arr.reshape(h, w, 3)
+
+    def _run_post(self, src_tex: int, w: int, h: int, matrix: np.ndarray | None,
+                  to709: np.ndarray | None) -> np.ndarray:
+        """Run the compiled view shader over `src_tex`; returns rows in the texture's row order."""
+        f = self._ensure_post_fbo(w, h)
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, f["fbo"])
+        gl.glViewport(0, 0, w, h)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glUseProgram(self.post_prog)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, src_tex)
+        gl.glUniform1i(gl.glGetUniformLocation(self.post_prog, "uImage"), 0)
+        for name, m in (("uInputMatrix", matrix), ("workingToRec709", to709)):
+            m = np.eye(3) if m is None else m
+            # row-major numpy data, no transpose: GLSL column i == matrix row i (HLSL semantics)
+            gl.glUniformMatrix3fv(gl.glGetUniformLocation(self.post_prog, name), 1, gl.GL_FALSE,
+                                  np.ascontiguousarray(m, dtype=np.float32).reshape(9))
+        gl.glBindVertexArray(self.empty_vao)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
+        gl.glBindVertexArray(0)
+        out = self._read_rgb(w, h)
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        return out
+
+    def apply_view_shader(self, arr: np.ndarray, matrix: np.ndarray | None, to709: np.ndarray | None) -> np.ndarray:
+        """Run the view shader over a flat image (top-down float RGB); returns display-referred RGB."""
+        if not self.post_prog:
+            raise RuntimeError("no compiled view shader")
+        self.make_current()
+        h, w, _ = arr.shape
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.flat_tex)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB32F, w, h, 0, gl.GL_RGB, gl.GL_FLOAT, arr)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+        return self._run_post(self.flat_tex, w, h, matrix, to709)
+
     # ---- draw ----
     def render(self, shape: str, cam: Camera, scene: np.ndarray, w: int, h: int,
-               texture: int | None = None, aspect: float | None = None) -> np.ndarray:
-        """Returns float32 RGB (top-down) in the working space that `scene` is expressed in."""
+               texture: int | None = None, aspect: float | None = None, post: bool = False,
+               input_matrix: np.ndarray | None = None, to709: np.ndarray | None = None) -> np.ndarray:
+        """Returns float32 RGB (top-down). Working-space values, or - with `post` - the output of the
+        compiled view shader (display-referred), run with `input_matrix` / `to709`."""
         self.make_current()
         fb = self._ensure_fbo(w, h)
         vao, count = self._mesh(shape, aspect or self.tex_aspect)
@@ -781,15 +1119,12 @@ class GLRenderer:
         gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, fb["ms"])
         gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, fb["resolve"])
         gl.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
+        if post and self.post_prog:
+            return self._run_post(fb["tex"], w, h, input_matrix, to709)[::-1]  # GL is bottom-up
         gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, fb["resolve"])
-        gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
-        data = gl.glReadPixels(0, 0, w, h, gl.GL_RGB, gl.GL_FLOAT)
+        arr = self._read_rgb(w, h)
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-        if isinstance(data, (bytes, bytearray)):
-            arr = np.frombuffer(data, dtype=np.float32)
-        else:
-            arr = np.asarray(data, dtype=np.float32)
-        return arr.reshape(h, w, 3)[::-1]  # GL is bottom-up
+        return arr[::-1]  # GL is bottom-up
 
 
 # --------------------------------------------------------------------------- #
@@ -892,27 +1227,144 @@ class DropSlot(QtWidgets.QLabel):
 
 
 # --------------------------------------------------------------------------- #
+# Colour-space picker: cascading menu (Photoshop / 3ds Max style) built from the OCIO config
+#   [extra entries] ---- Roles > ... ---- Families (tree) ---- Categories > ...
+# --------------------------------------------------------------------------- #
+class _FamilyNode:
+    __slots__ = ("kids", "items")
+
+    def __init__(self) -> None:
+        self.kids: dict[str, _FamilyNode] = {}
+        self.items: list[str] = []
+
+
+def populate_cs_menu(menu: QtWidgets.QMenu, ctx: OcioContext, pick, extras: list[str]) -> None:
+    menu.clear()
+
+    def add(m: QtWidgets.QMenu, label: str, name: str) -> None:
+        act = m.addAction(label)
+        act.triggered.connect(lambda _checked=False, n=name: pick(n))
+
+    for e in extras:
+        add(menu, e, e)
+    if extras:
+        menu.addSeparator()
+
+    if ctx.roles:                                     # roles: their own sub-menu
+        rm = menu.addMenu("Roles")
+        for role, cs in ctx.roles:
+            add(rm, f"{role}  →  {cs}", cs)
+        menu.addSeparator()
+
+    root = _FamilyNode()                              # families: a tree ("Input/Camera" -> Input > Camera)
+    for name, family, _cats in ctx.cs_meta:
+        node = root
+        parts = [p.strip() for p in family.split(ctx.family_sep) if p.strip()] if family else []
+        for part in parts:
+            node = node.kids.setdefault(part, _FamilyNode())
+        node.items.append(name)
+
+    def emit(m: QtWidgets.QMenu, node: _FamilyNode) -> None:
+        for key in sorted(node.kids, key=str.lower):
+            emit(m.addMenu(key), node.kids[key])
+        for name in node.items:
+            add(m, name, name)
+
+    emit(menu, root)
+
+    cats: dict[str, list[str]] = {}                   # categories, after all family classes
+    for name, _family, cs_cats in ctx.cs_meta:
+        for c in cs_cats:
+            cats.setdefault(c, []).append(name)
+    if cats:
+        menu.addSeparator()
+        header = menu.addAction("Categories")
+        header.setEnabled(False)
+        for c in sorted(cats, key=str.lower):
+            sm = menu.addMenu(c)
+            for name in cats[c]:
+                add(sm, name, name)
+
+
+class CsPicker(QtWidgets.QPushButton):
+    """Button that opens the cascading colour-space menu. Mimics the bits of QComboBox used here
+    (currentText, setCurrentText, currentTextChanged, currentIndexChanged)."""
+    currentTextChanged = QtCore.Signal(str)
+    currentIndexChanged = QtCore.Signal(int)
+
+    def __init__(self) -> None:
+        super().__init__("")
+        self._text = ""
+        self._valid: set[str] = set()
+        self._menu = QtWidgets.QMenu(self)
+        self._menu.setStyleSheet("QMenu { menu-scrollable: 1; }")  # long sub-menus scroll
+        self.setMenu(self._menu)
+        self.setStyleSheet("QPushButton { text-align: left; padding: 3px 8px; }")
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+
+    def sizeHint(self) -> QtCore.QSize:
+        s = super().sizeHint()
+        s.setWidth(min(s.width(), 260))
+        return s
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        s = super().minimumSizeHint()
+        s.setWidth(140)
+        return s
+
+    def currentText(self) -> str:
+        return self._text
+
+    def setCurrentText(self, text: str) -> None:
+        if text == self._text or text not in self._valid:
+            return
+        self._show(text)
+        self.currentTextChanged.emit(text)
+        self.currentIndexChanged.emit(0)
+
+    def _show(self, text: str) -> None:
+        self._text = text
+        self.setText(text)
+        self.setToolTip(text)
+
+    def set_config(self, ctx: OcioContext, extras: tuple[str, ...] = (), keep: str = "", default: str = "") -> None:
+        """(Re)build the menu from `ctx`; keeps `keep` if it still exists, else `default`. Silent."""
+        self._valid = set(ctx.colorspaces) | set(extras)
+        populate_cs_menu(self._menu, ctx, self.setCurrentText, list(extras))
+        self._show(keep if keep in self._valid else default)
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline stages (used for the final texture and for the Pipeline-tab thumbnails)
 # --------------------------------------------------------------------------- #
 @dataclass
 class Stages:
     inp: np.ndarray      # 1. image as loaded
     inp_cs: str          #    colour space it is interpreted as
-    ws: np.ndarray       # 2. after working-space conversion (OCIO decode + OCIO gamut)
+    ws: np.ndarray       # 2. after the OCIO conversion input space -> working space
     ws_cs: str
     mx: np.ndarray       # 3. after the (optional) matrix override; this is the final texture
     mx_cs: str
 
 
-def run_pipeline(ctx: OcioContext, image: np.ndarray, is_srgb: bool, convert: bool,
-                 override: bool, matrix: np.ndarray) -> Stages:
-    inp_cs = ctx.srgb_tex if is_srgb else ctx.lin709
-    if not convert:  # values are passed on untouched; read as Linear Rec.709 for display purposes
-        return Stages(image, inp_cs, image, ctx.lin709, image, ctx.lin709)
-    lin = ctx.convert(image, ctx.srgb_tex, ctx.lin709) if is_srgb else image
-    ws = ctx.convert(lin, ctx.lin709, ctx.acescg)
-    mx = (lin @ matrix.T).astype(np.float32) if override else ws
-    return Stages(image, inp_cs, ws, ctx.acescg, mx, ctx.acescg)
+@dataclass
+class PipelineParams:
+    input_cs: str                 # colour space the image is stored in (from the OCIO config)
+    target_cs: str | None         # working space to convert to; None = pass values through untouched
+    override: bool                # use `matrix` instead of the OCIO transform
+    matrix: np.ndarray            # 3x3, applied to the image decoded to Linear Rec.709
+
+
+def run_pipeline(ctx: OcioContext, image: np.ndarray, p: PipelineParams) -> Stages:
+    if p.target_cs is None:  # values are passed on untouched; read as Linear Rec.709 for display purposes
+        return Stages(image, p.input_cs, image, ctx.lin709, image, ctx.lin709)
+    ws = ctx.convert(image, p.input_cs, p.target_cs)              # OCIO: input space -> working space
+    if p.override:                                                 # custom: decode to Rec.709 linear, then matrix
+        lin = ctx.convert(image, p.input_cs, ctx.lin709)
+        mx = (lin @ p.matrix.T).astype(np.float32)
+    else:
+        mx = ws
+    return Stages(image, p.input_cs, ws, p.target_cs, mx, p.target_cs)
 
 
 def fmt_rgb(a: np.ndarray) -> str:
@@ -948,6 +1400,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setting_setters: dict[str, callable] = {}
         self.scene_709 = scene_from_settings(self.d)
         self.scene_acescg = self.scene_709
+        self.shader_ok = False                       # custom view shader compiled successfully?
+        self._to709_cache: dict[str, np.ndarray] = {}
         self.caps_srgb: list[QtWidgets.QLabel] = []
         self.caps_acescg: list[QtWidgets.QLabel] = []
 
@@ -970,6 +1424,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1400, 880)
 
     # ------------------------------------------------------------------ UI --
+    @staticmethod
+    def _cs_combo() -> CsPicker:
+        return CsPicker()
+
     def _viewport_pair(self) -> tuple[QtWidgets.QHBoxLayout, ViewportWidget, ViewportWidget]:
         row = QtWidgets.QHBoxLayout()
         vps = []
@@ -990,42 +1448,84 @@ class MainWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QWidget()
         lay = QtWidgets.QHBoxLayout(root)
 
-        left = QtWidgets.QVBoxLayout()
-        lay.addLayout(left, 0)
+        left_widget = QtWidgets.QWidget()          # scrollable: the shader editor makes this column tall
+        left = QtWidgets.QVBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 6, 0)
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidget(left_widget)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(460)
+        lay.addWidget(left_scroll, 0)
 
         g1 = QtWidgets.QGroupBox("1 · Input image")
         l1 = QtWidgets.QVBoxLayout(g1)
         self.slot = DropSlot()
         self.slot.fileDropped.connect(self.load_path)
-        self.chk_srgb = QtWidgets.QCheckBox("Treat image as sRGB  (unchecked = linear / raw)")
-        self.chk_srgb.setChecked(True)
+        self.cmb_input_cs = self._cs_combo()
         l1.addWidget(self.slot)
-        l1.addWidget(self.chk_srgb)
+        f1v = QtWidgets.QFormLayout()
+        f1v.addRow("Input colour space:", self.cmb_input_cs)
+        l1.addLayout(f1v)
         left.addWidget(g1)
 
         g2 = QtWidgets.QGroupBox("2 · Working-space conversion")
         l2 = QtWidgets.QVBoxLayout(g2)
-        self.chk_convert = QtWidgets.QCheckBox("Convert image (sRGB / Raw) → ACEScg")
-        self.chk_convert.setChecked(True)
-        l2.addWidget(self.chk_convert)
-        note = QtWidgets.QLabel("Off = pixel values go to the renderers untouched.\n"
-                                "Raw is assumed to have Rec.709 primaries.")
+        self.cmb_target = self._cs_combo()
+        f2v = QtWidgets.QFormLayout()
+        f2v.addRow("Convert to:", self.cmb_target)
+        l2.addLayout(f2v)
+        note = QtWidgets.QLabel("Uses the OCIO transform from the input space to this space.\n"
+                                "'None' = pixel values go to the renderers untouched.")
         note.setStyleSheet("color:#888;")
         l2.addWidget(note)
         left.addWidget(g2)
 
-        g3 = QtWidgets.QGroupBox("3 · View transform")
+        g3 = QtWidgets.QGroupBox("4 · View transform")
         l3 = QtWidgets.QFormLayout(g3)
         self.cmb_view = QtWidgets.QComboBox()
         self.lbl_display = QtWidgets.QLabel()
         l3.addRow("Display:", self.lbl_display)
         l3.addRow("View:", self.cmb_view)
-        left.addWidget(g3)
+        self.chk_shader = QtWidgets.QCheckBox("Override with custom HLSL shader")
+        self.chk_shader.setToolTip("Replaces the OCIO view transform in all previews with the shader below")
+        l3.addRow(self.chk_shader)
+        self.shader_panel = QtWidgets.QWidget()      # editor + buttons + log; shown only while the override is on
+        sp = QtWidgets.QVBoxLayout(self.shader_panel)
+        sp.setContentsMargins(0, 0, 0, 0)
+        self.shader_edit = QtWidgets.QPlainTextEdit()
+        self.shader_edit.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont))
+        self.shader_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self.shader_edit.setTabStopDistance(28)
+        self.shader_edit.setMinimumHeight(260)
+        self.shader_edit.setPlainText(self.d.view_shader)
+        sp.addWidget(self.shader_edit)
+        shader_btns = QtWidgets.QHBoxLayout()
+        btn_compile = QtWidgets.QPushButton("Compile && apply")
+        btn_compile.clicked.connect(self.compile_shader)
+        btn_shader_reset = QtWidgets.QPushButton("Reset to default")
+        btn_shader_reset.clicked.connect(self.reset_shader)
+        shader_btns.addWidget(btn_compile)
+        shader_btns.addWidget(btn_shader_reset)
+        sp.addLayout(shader_btns)
+        self.lbl_shader = QtWidgets.QLabel("Not compiled yet.")
+        self.lbl_shader.setWordWrap(True)
+        self.lbl_shader.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_shader.setStyleSheet("color:#888; font-size:11px;")
+        sp.addWidget(self.lbl_shader)
+        l3.addRow(self.shader_panel)
+        self.shader_panel.setVisible(self.chk_shader.isChecked())   # hidden until the checkbox is ticked
 
-        g4 = QtWidgets.QGroupBox("4 · Input matrix override (Rec.709 → ACEScg gamut step)")
+        g4 = QtWidgets.QGroupBox("3 · Input matrix override (Linear Rec.709 → working space)")
         l4 = QtWidgets.QVBoxLayout(g4)
-        self.chk_matrix = QtWidgets.QCheckBox("Override OCIO gamut matrix")
+        self.chk_matrix = QtWidgets.QCheckBox("Use this matrix instead of the OCIO transform")
         l4.addWidget(self.chk_matrix)
+        self.chk_shader_matrix = QtWidgets.QCheckBox("Use manual shader override")
+        self.chk_shader_matrix.setToolTip(
+            "Hand the manual matrix below to the view-transform shader (inputMatrix), even when the texture "
+            "itself still uses the OCIO transform. Ticking it also switches the HLSL override on.")
+        l4.addWidget(self.chk_shader_matrix)
         grid = QtWidgets.QGridLayout()
         self.spins: list[QtWidgets.QDoubleSpinBox] = []
         for i in range(9):
@@ -1044,7 +1544,8 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_paste.setToolTip("Parses spaced columns (one row per line) or [[a, b, c], ...] with brackets and commas")
         btn_paste.clicked.connect(self.paste_matrix)
         l4.addWidget(btn_paste)
-        left.addWidget(g4)
+        left.addWidget(g4)   # 3 · Input matrix
+        left.addWidget(g3)   # 4 · View transform
 
         btn_cfg = QtWidgets.QPushButton("Load OCIO config…")
         btn_cfg.clicked.connect(self.load_config_dialog)
@@ -1093,8 +1594,8 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Show as:", combo)
         v.addLayout(form)
         self.show_combos[key] = combo
-        chk = QtWidgets.QCheckBox("Show this step in the renderers")
-        chk.setToolTip("Override: the two 3D renderers use this step's texture instead of the final one")
+        chk = QtWidgets.QCheckBox("Show this step in the final renderers")
+        chk.setToolTip("Override: the final renderers (live Viewer tab + snapshots below) use this step's texture instead of the final one")
         chk.toggled.connect(lambda checked, k=key: self.on_override(k, checked))
         v.addWidget(chk)
         self.override_checks[key] = chk
@@ -1126,6 +1627,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_preview.addItems(["Raw values (numbers as-is, clamped)",
                                    "Colour-managed (through the view transform)"])
         top.addWidget(self.cmb_preview)
+        top.addSpacing(16)
+        top.addWidget(QtWidgets.QLabel("Primitive:"))
+        self.cmb_shape2 = QtWidgets.QComboBox()
+        self.cmb_shape2.addItems(PRIMITIVES)
+        top.addWidget(self.cmb_shape2)
+        top.addSpacing(16)
+        top.addWidget(QtWidgets.QLabel("Stage snapshot camera:"))
+        self.cmb_snapcam = QtWidgets.QComboBox()
+        self.cmb_snapcam.addItems(["Default (from Settings)", "Same as live Viewer camera"])
+        top.addWidget(self.cmb_snapcam)
         top.addStretch(1)
         outer.addLayout(top)
 
@@ -1134,10 +1645,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 1 · Input image
         c1, v1, self.th_in = self._card("1 · Input image", "in")
-        self.cmb_interp = QtWidgets.QComboBox()
-        self.cmb_interp.addItems(["sRGB (encoded)", "Linear / Raw"])
+        self.cmb_interp = self._cs_combo()
         f1 = QtWidgets.QFormLayout()
-        f1.addRow("Interpret as:", self.cmb_interp)
+        f1.addRow("Colour space:", self.cmb_interp)
         v1.addLayout(f1)
         self.info_in = self._info_label()
         v1.addWidget(self.info_in)
@@ -1145,10 +1655,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 2 · Working space
         c2, v2, self.th_ws = self._card("2 · Working space", "ws")
-        self.cmb_conv = QtWidgets.QComboBox()
-        self.cmb_conv.addItems(["None (values as-is)", "ACEScg"])
+        self.cmb_conv = self._cs_combo()
         f2 = QtWidgets.QFormLayout()
-        f2.addRow("Convert to:", self.cmb_conv)
+        f2.addRow("Working space:", self.cmb_conv)
         v2.addLayout(f2)
         self.info_ws = self._info_label()
         v2.addWidget(self.info_ws)
@@ -1157,9 +1666,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # 3 · Input matrix
         c3, v3, self.th_mx = self._card("3 · Input matrix", "mx")
         self.cmb_mat = QtWidgets.QComboBox()
-        self.cmb_mat.addItems(["OCIO default (Rec.709 → ACEScg)", "Custom override"])
+        self.cmb_mat.addItems(["OCIO transform", "Custom matrix"])
         f3 = QtWidgets.QFormLayout()
-        f3.addRow("Gamut matrix:", self.cmb_mat)
+        f3.addRow("Conversion:", self.cmb_mat)
+        self.cmb_shmat = QtWidgets.QComboBox()
+        self.cmb_shmat.addItems(["OCIO default matrix", "Manual shader override"])
+        self.cmb_shmat.setToolTip("Matrix handed to the view-transform shader")
+        f3.addRow("Shader gets:", self.cmb_shmat)
         v3.addLayout(f3)
         self.info_mx = self._info_label(mono=True)
         v3.addWidget(self.info_mx)
@@ -1189,17 +1702,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 chain.addWidget(self._arrow())
             chain.addWidget(c, 1)
 
-        # 5 · Renderers
+        # 5 · Final renderers: full live 3D (orbit / zoom / pan), same camera as the Viewer tab
+        down = QtWidgets.QLabel("▼")
+        down.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        down.setStyleSheet("font-size:20px; color:#888;")
+        outer.addWidget(down)
         self.box_render = c5 = QtWidgets.QGroupBox()
         v5 = QtWidgets.QVBoxLayout(c5)
         r5 = QtWidgets.QHBoxLayout()
-        r5.addWidget(QtWidgets.QLabel("Primitive:"))
-        self.cmb_shape2 = QtWidgets.QComboBox()
-        self.cmb_shape2.addItems(PRIMITIVES)
-        r5.addWidget(self.cmb_shape2)
         btn_cam = QtWidgets.QPushButton("Reset camera")
         btn_cam.clicked.connect(self.camera.reset)
         r5.addWidget(btn_cam)
+        r5.addWidget(QtWidgets.QLabel("Left-drag: orbit · wheel: zoom · right-drag: pan"))
         r5.addStretch(1)
         v5.addLayout(r5)
         row, self.pipe_srgb, self.pipe_acescg = self._viewport_pair()
@@ -1208,15 +1722,19 @@ class MainWindow(QtWidgets.QMainWindow):
         return page
 
     def _wire(self) -> None:
-        for w in (self.chk_srgb, self.chk_convert, self.chk_matrix):
-            w.toggled.connect(self.schedule_texture)
-        self.chk_convert.toggled.connect(self._sync_enabled)
+        self.chk_matrix.toggled.connect(self.schedule_texture)
         self.chk_matrix.toggled.connect(self._sync_enabled)
 
-        # Pipeline-tab dropdowns <-> Viewer-tab controls (index of the "checked" state)
-        self._link_combo_check(self.cmb_interp, self.chk_srgb, checked_index=0)
-        self._link_combo_check(self.cmb_conv, self.chk_convert, checked_index=1)
+        # Pipeline-tab dropdowns <-> Viewer-tab controls
+        self._link_combos(self.cmb_input_cs, self.cmb_interp)
+        self._link_combos(self.cmb_target, self.cmb_conv)
         self._link_combo_check(self.cmb_mat, self.chk_matrix, checked_index=1)
+        self._link_combo_check(self.cmb_shmat, self.chk_shader_matrix, checked_index=1)
+        self.chk_shader_matrix.toggled.connect(self.on_shader_matrix_toggled)
+        for cb in (self.cmb_input_cs, self.cmb_interp):
+            cb.currentIndexChanged.connect(lambda _=0: (self.schedule_texture(), self.request_previews()))
+        for cb in (self.cmb_target, self.cmb_conv):
+            cb.currentIndexChanged.connect(lambda _=0: self.on_target_changed())
         self._link_combos(self.cmb_view, self.cmb_view2)
         self._link_combos(self.cmb_shape, self.cmb_shape2)
 
@@ -1227,9 +1745,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for cb in self.show_combos.values():
             cb.currentIndexChanged.connect(lambda _=0: self.request_previews())
         self.cmb_preview.currentIndexChanged.connect(lambda _=0: self.request_previews())
+        self.cmb_snapcam.currentIndexChanged.connect(lambda _=0: self.request_previews())
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.camera.changed.connect(lambda: self.request_redraw(fast=True))
         self.settings.changed.connect(self.on_settings_changed)
+        self.chk_shader.toggled.connect(self.on_shader_toggled)
+        self.chk_matrix.toggled.connect(lambda _=False: self.request_redraw())
+        for sb in self.spins:
+            sb.valueChanged.connect(lambda _=0: self.shader_active() and self.request_redraw())
 
     @staticmethod
     def _link_combo_check(combo: QtWidgets.QComboBox, chk: QtWidgets.QCheckBox, checked_index: int) -> None:
@@ -1252,6 +1775,70 @@ class MainWindow(QtWidgets.QMainWindow):
         a.currentTextChanged.connect(lambda t: b.setCurrentText(t) if b.currentText() != t else None)
         b.currentTextChanged.connect(lambda t: a.setCurrentText(t) if a.currentText() != t else None)
 
+    # ------------------------------------------ custom view-transform shader --
+    def shader_active(self) -> bool:
+        return self.chk_shader.isChecked() and self.shader_ok
+
+    def active_matrix(self) -> np.ndarray:
+        """The matrix handed to the shader: the manual grid when "Use manual shader override" is ticked
+        or the custom matrix is in use for the texture, else the OCIO default."""
+        use_manual = self.chk_shader_matrix.isChecked() or \
+            (self.target_cs() is not None and self.chk_matrix.isChecked())
+        return self.matrix() if use_manual else self.ocio_matrix
+
+    def on_shader_matrix_toggled(self, checked: bool) -> None:
+        if checked and not self.chk_shader.isChecked():
+            self.chk_shader.setChecked(True)      # a matrix for a disabled shader would do nothing
+        self._sync_enabled()
+        self.request_redraw()
+        self.request_previews()
+
+    def to709(self, ws: str) -> np.ndarray:
+        if ws not in self._to709_cache:
+            try:
+                m = np.eye(3) if ws == self.ctx.lin709 else self.ctx.linear_matrix(ws, self.ctx.lin709)
+            except Exception:  # noqa: BLE001
+                m = np.eye(3)
+            self._to709_cache[ws] = m
+        return self._to709_cache[ws]
+
+    def compile_shader(self) -> None:
+        src = self.shader_edit.toPlainText()
+        ok, log = self.gl.compile_post(src)
+        self.shader_ok = ok
+        if ok:
+            state = "used for all previews" if self.chk_shader.isChecked() else "tick the checkbox to use it"
+            self.lbl_shader.setStyleSheet("color:#4a4; font-size:11px;")
+            self.lbl_shader.setText(f"Compiled OK - {state}." + (f"\n{log.strip()}" if log.strip() else ""))
+            if src != self.d.view_shader:
+                self.settings.set("view_shader", src)
+        else:
+            self.lbl_shader.setStyleSheet("color:#d55; font-size:11px;")
+            self.lbl_shader.setText("Compile failed - the OCIO view transform is used instead.\n" + log.strip()[-1800:])
+        self.request_redraw()
+        self.request_previews()
+
+    def on_shader_toggled(self, checked: bool) -> None:
+        self.shader_panel.setVisible(checked)
+        if checked and not self.shader_ok:
+            self.compile_shader()
+        else:
+            self.request_redraw()
+            self.request_previews()
+
+    def reset_shader(self) -> None:
+        self.shader_edit.setPlainText(DEFAULT_VIEW_SHADER)
+        self.compile_shader()
+
+    def render_view(self, shape: str, cam: Camera, ws: str, scene: np.ndarray, w: int, h: int,
+                    texture: int | None = None, aspect: float | None = None) -> np.ndarray:
+        """Render + view transform -> display-referred float RGB (OCIO view, or the custom shader)."""
+        if self.shader_active():
+            return self.gl.render(shape, cam, scene, w, h, texture=texture, aspect=aspect, post=True,
+                                  input_matrix=self.active_matrix(), to709=self.to709(ws))
+        lin = self.gl.render(shape, cam, scene, w, h, texture=texture, aspect=aspect)
+        return self.ctx.to_display(np.maximum(lin, 0.0), ws, self.cmb_view.currentText())
+
     # ------------------------------------------------------ Settings tab --
     def _build_settings_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -1263,6 +1850,10 @@ class MainWindow(QtWidgets.QMainWindow):
         btn.clicked.connect(self.settings.reset)
         top.addWidget(btn)
         outer.addLayout(top)
+        where = QtWidgets.QLabel(f"Settings file: {self.settings.path}")
+        where.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        where.setStyleSheet("color:#888;")
+        outer.addWidget(where)
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1343,9 +1934,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_settings_changed(self, name: str) -> None:
         d = self.d
+        if name == "view_shader":
+            return
         if name == "*":  # full reset: refresh every widget
             for n, setter in self.setting_setters.items():
                 setter(getattr(d, n))
+            self.shader_edit.setPlainText(d.view_shader)
+            self.shader_ok = False
+            if self.chk_shader.isChecked():
+                self.compile_shader()
         self.tex_timer.setInterval(d.texture_debounce_ms)
         self.refine_timer.setInterval(d.refine_delay_ms)
         self.thumb_cam.reset(emit=False)
@@ -1357,6 +1954,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scene_acescg = self.ctx.convert(self.scene_709.reshape(1, 4, 3), self.ctx.lin709,
                                              self.ctx.acescg).reshape(4, 3)
         self.gl.settings_changed(name)
+        if self.settings.save_error:
+            self.statusBar().showMessage(self.settings.save_error, 10000)
         if name in ("anisotropy", "*") and self.tex is not None:
             self.gl.set_texture(self.tex)  # re-upload with the new filtering
         self.request_redraw()
@@ -1377,7 +1976,8 @@ class MainWindow(QtWidgets.QMainWindow):
             sb.blockSignals(True)
             sb.setValue(float(val))
             sb.blockSignals(False)
-        self.chk_convert.setChecked(True)   # the matrix only takes effect when converting
+        if self.target_cs() is None:        # the matrix only takes effect when converting
+            self.cmb_target.setCurrentText(self.ctx.acescg)
         self.chk_matrix.setChecked(True)
         self._sync_enabled()
         self.schedule_texture()
@@ -1397,6 +1997,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self.override_key == key:
             self.override_key = None
         self.apply_render_texture()
+        self.request_previews()
 
     def render_texture_array(self) -> np.ndarray | None:
         st = self.stages_full
@@ -1421,7 +2022,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for cap in self.caps_acescg:
             cap.setText(f"ACEScg renderer  ({ctx.acescg}){suffix}")
         src = f"step '{self.STAGE_TITLES[self.override_key]}'" if self.override_key else "final texture"
-        self.box_render.setTitle(f"5 · Renderers  ({src} → primitive → view transform)")
+        self.box_render.setTitle(f"5 · Final renderers - live 3D  ({src} → primitive → view transform)")
 
     def on_tab_changed(self, _i: int) -> None:
         self.request_redraw()
@@ -1430,7 +2031,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------- context / config --
     def bind_context(self, ctx: OcioContext) -> None:
         self.ctx = ctx
-        self.ocio_matrix = ctx.gamut_matrix()
+        self._to709_cache.clear()
         self.scene_709 = scene_from_settings(self.d)
         self.scene_acescg = ctx.convert(self.scene_709.reshape(1, 4, 3), ctx.lin709, ctx.acescg).reshape(4, 3)
         for cb in (self.cmb_view, self.cmb_view2):
@@ -1441,7 +2042,9 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.blockSignals(False)
         for lb in (self.lbl_display, self.lbl_display2):
             lb.setText(ctx.display)
-        self.lbl_cfg.setText(f"Config: {ctx.config.getName() or ctx.config.getDescription()[:60]}")
+        name = ctx.config.getName() or ctx.config.getDescription()[:60]
+        self.lbl_cfg.setText(f"Config: {name}\n{ctx.source}" if ctx.source else f"Config: {name}")
+        self._fill_cs_combos()
         self.update_captions()
         self.reset_matrix()
         self._sync_enabled()
@@ -1449,20 +2052,66 @@ class MainWindow(QtWidgets.QMainWindow):
         self.request_previews()
 
     def load_config_dialog(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "OCIO config", "", "OCIO config (*.ocio)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "OCIO config", str(app_dir()),
+                                                        "OCIO config (*.ocio *.ocioz)")
         if not path:
             return
         try:
-            self.bind_context(OcioContext(OCIO.Config.CreateFromFile(path)))
+            ctx = OcioContext(OCIO.Config.CreateFromFile(path))
         except Exception as e:  # noqa: BLE001
             QtWidgets.QMessageBox.critical(self, "Config error", str(e))
+            return
+        ref = portable_ref(path)
+        ctx.source = ref
+        self.bind_context(ctx)
+        answer = QtWidgets.QMessageBox.question(
+            self, "OCIO config", f"Use this config at start-up?\n{ref}",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+        if answer == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.settings.set("default_config", ref)
+            if "default_config" in self.setting_setters:
+                self.setting_setters["default_config"](ref)
 
-    # ------------------------------------------------------------ matrix --
-    def reset_matrix(self) -> None:
-        for sb, val in zip(self.spins, self.ocio_matrix.flatten()):
+    # ------------------------------------------------ colour-space combos --
+    def target_cs(self) -> str | None:
+        t = self.cmb_target.currentText()
+        return None if (not t or t == NO_CONVERSION) else t
+
+    def input_cs(self) -> str:
+        return self.cmb_input_cs.currentText() or self.ctx.srgb_tex
+
+    def _fill_cs_combos(self) -> None:
+        ctx = self.ctx
+        prev_in, prev_tg = self.cmb_input_cs.currentText(), self.cmb_target.currentText()
+        for cb in (self.cmb_input_cs, self.cmb_interp):
+            cb.set_config(ctx, (), keep=prev_in, default=ctx.srgb_tex)
+        for cb in (self.cmb_target, self.cmb_conv):
+            cb.set_config(ctx, (NO_CONVERSION,), keep=prev_tg, default=ctx.acescg)
+
+    def on_target_changed(self) -> None:
+        self._sync_enabled()
+        self.ocio_matrix = self._compute_ocio_matrix()
+        if not self.chk_matrix.isChecked():   # keep a custom matrix, but track the OCIO default otherwise
+            self._fill_spins(self.ocio_matrix)
+        self.schedule_texture()
+        self.request_previews()
+
+    def _compute_ocio_matrix(self) -> np.ndarray:
+        try:
+            return self.ctx.gamut_matrix(self.target_cs() or self.ctx.acescg)
+        except Exception:  # noqa: BLE001
+            return np.eye(3)
+
+    def _fill_spins(self, m: np.ndarray) -> None:
+        for sb, val in zip(self.spins, np.asarray(m).flatten()):
             sb.blockSignals(True)
             sb.setValue(float(val))
             sb.blockSignals(False)
+
+    # ------------------------------------------------------------ matrix --
+    def reset_matrix(self) -> None:
+        self.ocio_matrix = self._compute_ocio_matrix()
+        self._fill_spins(self.ocio_matrix)
         self.schedule_texture()
         self.request_previews()
 
@@ -1470,10 +2119,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return np.array([sb.value() for sb in self.spins], dtype=np.float32).reshape(3, 3)
 
     def _sync_enabled(self) -> None:
-        conv = self.chk_convert.isChecked()
+        conv = self.target_cs() is not None
         self.chk_matrix.setEnabled(conv)
         self.cmb_mat.setEnabled(conv)
-        on = conv and self.chk_matrix.isChecked()
+        on = (conv and self.chk_matrix.isChecked()) or self.chk_shader_matrix.isChecked()
         for sb in self.spins:
             sb.setEnabled(on)
 
@@ -1486,7 +2135,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.image, self.image_path = arr, path
         self.thumb = box_downscale(arr, self.d.thumb_source_size)
-        self.chk_srgb.setChecked(not is_float)  # EXR/HDR are normally linear
+        self.cmb_input_cs.setCurrentText(self.ctx.lin709 if is_float else self.ctx.srgb_tex)  # EXR/HDR are normally linear
         prev = np.clip(arr, 0, 1)
         if is_float:
             prev = prev ** (1 / 2.2)
@@ -1498,34 +2147,30 @@ class MainWindow(QtWidgets.QMainWindow):
     def schedule_texture(self) -> None:
         self.tex_timer.start()
 
-    def _params(self) -> tuple[bool, bool, bool]:
-        conv = self.chk_convert.isChecked()
-        return self.chk_srgb.isChecked(), conv, conv and self.chk_matrix.isChecked()
+    def _params(self) -> PipelineParams:
+        target = self.target_cs()
+        return PipelineParams(self.input_cs(), target, target is not None and self.chk_matrix.isChecked(),
+                              self.matrix())
 
     def describe_pipeline(self) -> list[str]:
-        ctx = self.ctx
-        is_srgb, conv, override = self._params()
+        ctx, p = self.ctx, self._params()
         h, w = self.image.shape[:2]  # type: ignore[union-attr]
-        log = [f"Input  : {Path(self.image_path).name}  {w}x{h}  "
-               f"interpreted as {'sRGB-encoded' if is_srgb else 'linear/raw'}"]
-        if not conv:
+        log = [f"Input  : {Path(self.image_path).name}  {w}x{h}  read as '{p.input_cs}'"]
+        if p.target_cs is None:
             log.append("Convert OFF -> texture = pixel values as loaded (no OCIO applied)")
-            return log
-        log.append(f"Decode : '{ctx.srgb_tex}' -> '{ctx.lin709}'" if is_srgb
-                   else f"Decode : none (raw treated as '{ctx.lin709}')")
-        if override:
-            log.append("Gamut  : custom matrix override\n         " + "\n         ".join(
-                " ".join(f"{v: .5f}" for v in r) for r in self.matrix()))
+        elif p.override:
+            log.append(f"Decode : OCIO '{p.input_cs}' -> '{ctx.lin709}'")
+            log.append(f"Matrix : custom, Linear Rec.709 -> '{p.target_cs}'\n         " + "\n         ".join(
+                " ".join(f"{v: .5f}" for v in r) for r in p.matrix))
         else:
-            log.append(f"Gamut  : OCIO '{ctx.lin709}' -> '{ctx.acescg}'")
+            log.append(f"Convert: OCIO '{p.input_cs}' -> '{p.target_cs}'")
         return log
 
     def rebuild_texture(self) -> None:
         if self.image is None:
             return
         try:
-            is_srgb, conv, override = self._params()
-            st = run_pipeline(self.ctx, self.image, is_srgb, conv, override, self.matrix())
+            st = run_pipeline(self.ctx, self.image, self._params())
             self.stages_full = st
             self.pipeline_log = self.describe_pipeline() + [f"Final texture {fmt_rgb(st.mx)}"]
             self.tex = self.render_texture_array()   # final texture, or the step chosen for override
@@ -1566,8 +2211,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 W, H = vp.pixel_size()
                 s = min(1.0, self.d.max_render_size / max(W, H)) * (self.d.interactive_scale if fast else 1.0)
                 w, h = max(16, int(W * s)), max(16, int(H * s))
-                lin = self.gl.render(shape, self.camera, scene, w, h)
-                disp = ctx.to_display(np.maximum(lin, 0.0), ws, view)
+                disp = self.render_view(shape, self.camera, ws, scene, w, h)
                 vp.set_image(to_qimage((np.clip(disp, 0, 1) * 255 + 0.5).astype(np.uint8)))
         except Exception as e:  # noqa: BLE001
             self.log.setPlainText("\n".join(self.pipeline_log + [f"RENDER ERROR: {e}"]))
@@ -1576,9 +2220,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.pipeline_log or self.image is None:
             return
         shown = f"step '{self.STAGE_TITLES[self.override_key]}' (override)" if self.override_key else "final texture"
+        vt = ("custom HLSL shader (inputMatrix: " + ("manual" if self.chk_shader_matrix.isChecked() or
+                                                    (self.target_cs() is not None and self.chk_matrix.isChecked())
+                                                    else "OCIO default") + ")") if self.shader_active() else \
+            f"display '{self.ctx.display}' / view '{self.cmb_view.currentText()}'"
         extra = [f"Renderers show: {shown}",
                  f"Shape  : {self.cmb_shape.currentText()}   (GPU: {self.gl.info})",
-                 f"View   : working space -> display '{self.ctx.display}' / view '{self.cmb_view.currentText()}'",
+                 f"View   : working space -> {vt}",
                  "Both viewports use the SAME texture numbers and the SAME lights "
                  "(lights converted to each working space)."]
         self.log.setPlainText("\n".join(self.pipeline_log + extra))
@@ -1598,10 +2246,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         ctx, view = self.ctx, self.cmb_view.currentText()
         shape = self.cmb_shape.currentText()
-        is_srgb, conv, override = self._params()
+        p = self._params()
         notes = {k: "" for k in self.show_combos}
+        cam = self.camera if self.cmb_snapcam.currentIndex() == 1 else self.thumb_cam
+        vt = "the custom HLSL shader" if self.shader_active() else f"view '{view}'"
         try:
-            st = run_pipeline(ctx, self.thumb, is_srgb, conv, override, self.matrix())
+            st = run_pipeline(ctx, self.thumb, p)
             managed = self.cmb_preview.currentIndex() == 1
             stages = {"in": (st.inp, st.inp_cs, self.th_in), "ws": (st.ws, st.ws_cs, self.th_ws),
                       "mx": (st.mx, st.mx_cs, self.th_mx), "view": (st.mx, st.mx_cs, self.th_view)}
@@ -1609,7 +2259,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 arr = np.nan_to_num(arr)
                 mode = self.show_combos[key].currentIndex()
                 if mode == 0:  # flat texture
-                    if managed or key == "view":
+                    if key == "view" and self.shader_active():
+                        disp = self.gl.apply_view_shader(arr, self.active_matrix(), self.to709(cs))
+                    elif managed or key == "view":
                         disp = ctx.to_display(np.maximum(arr, 0), cs, view)
                     else:
                         disp = arr
@@ -1617,11 +2269,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     ws, scene = (ctx.lin709, self.scene_709) if mode == 1 else (ctx.acescg, self.scene_acescg)
                     tid = self.gl.set_stage_texture(key, arr)
                     tw, th = self.d.thumb_render_width, self.d.thumb_render_height
-                    lin = self.gl.render(shape, self.thumb_cam, scene, tw, th, texture=tid,
-                                         aspect=arr.shape[1] / arr.shape[0])
-                    disp = ctx.to_display(np.maximum(lin, 0), ws, view)
+                    disp = self.render_view(shape, cam, ws, scene, tw, th, texture=tid,
+                                            aspect=arr.shape[1] / arr.shape[0])
                     notes[key] = (f"\nRendered on {shape} by the {self.SHOW_MODES[mode]}: numbers read as "
-                                  f"'{ws}', then view '{view}'.")
+                                  f"'{ws}', then {vt}.")
                 self._set_thumb(label, disp)
         except Exception as e:  # noqa: BLE001
             self.info_view.setText(f"Preview error: {e}")
@@ -1630,31 +2281,55 @@ class MainWindow(QtWidgets.QMainWindow):
         h, w = self.image.shape[:2]
         self.info_in.setText(f"{Path(self.image_path).name}\n{w}x{h} · read as '{st.inp_cs}'\n"
                              f"{fmt_rgb(st.inp)}{notes['in']}")
-        if conv:
-            chain = (f"'{ctx.srgb_tex}' → " if is_srgb else "") + f"'{ctx.lin709}' → '{ctx.acescg}' (OCIO)"
-            self.info_ws.setText(f"{chain}\n{fmt_rgb(st.ws)}{notes['ws']}")
+        if p.target_cs is not None:
+            self.info_ws.setText(f"OCIO: '{p.input_cs}' → '{p.target_cs}'\n{fmt_rgb(st.ws)}{notes['ws']}")
+            m, tag = (p.matrix, f"custom, Lin Rec.709 → '{p.target_cs}'") if p.override \
+                else (self.ocio_matrix, "OCIO transform (linear approx.)")
+            rows = "\n".join(" ".join(f"{v: .4f}" for v in r) for r in m)
+            self.info_mx.setText(f"{tag}\n{rows}\n{fmt_rgb(st.mx)}{notes['mx']}")
         else:
             self.info_ws.setText(f"No conversion: values kept as loaded and read as '{ctx.lin709}'.\n"
                                  f"{fmt_rgb(st.ws)}{notes['ws']}")
-        if not conv:
             self.info_mx.setText(f"n/a (conversion is off){notes['mx']}")
-        else:
-            m, tag = (self.matrix(), "custom") if override else (self.ocio_matrix, "OCIO default")
-            rows = "\n".join(" ".join(f"{v: .4f}" for v in r) for r in m)
-            self.info_mx.setText(f"{tag}\n{rows}\n{fmt_rgb(st.mx)}{notes['mx']}")
-        self.info_view.setText(f"'{st.mx_cs}' → display '{ctx.display}', view '{view}'.{notes['view']}")
+        self.info_view.setText(f"'{st.mx_cs}' → " + ("custom HLSL shader" if self.shader_active()
+                               else f"display '{ctx.display}', view '{view}'") + f".{notes['view']}")
+
+
+def load_ocio_context(settings: Settings) -> tuple[OcioContext, list[str]]:
+    """Load the start-up config: $OCIO, then the configured default, then the built-in config.
+    If the configured default fails it is reset to the built-in config. Returns (context, warnings)."""
+    candidates: list[tuple[str, str]] = []
+    if os.environ.get("OCIO"):
+        candidates.append(("$OCIO", os.environ["OCIO"]))
+    configured = settings.d.default_config.strip() or BUILTIN_CONFIG
+    candidates.append(("settings", configured))
+    if configured != BUILTIN_CONFIG:
+        candidates.append(("built-in", BUILTIN_CONFIG))
+
+    warnings: list[str] = []
+    settings_failed = False
+    for label, ref in candidates:
+        try:
+            ctx = OcioContext(OCIO.Config.CreateFromFile(resolve_config_ref(ref)))
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"Could not load the {label} OCIO config '{ref}':\n{e}")
+            settings_failed = settings_failed or label == "settings"
+            continue
+        ctx.source = ref
+        if settings_failed:
+            settings.set("default_config", BUILTIN_CONFIG)
+            warnings.append(f"The default config in settings was reset to the built-in '{BUILTIN_CONFIG}'.")
+        return ctx, warnings
+    raise RuntimeError("\n\n".join(warnings))
 
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
-    app.setOrganizationName("OCIOPipelineViewer")
     settings = Settings()
     try:
-        cfg = OCIO.Config.CreateFromEnv() if os.environ.get("OCIO") \
-            else OCIO.Config.CreateFromFile(settings.d.default_config)
-        ctx = OcioContext(cfg)
+        ctx, warnings = load_ocio_context(settings)
     except Exception as e:  # noqa: BLE001
-        QtWidgets.QMessageBox.critical(None, "OCIO error", f"Could not initialise OCIO config:\n{e}")
+        QtWidgets.QMessageBox.critical(None, "OCIO error", f"Could not initialise any OCIO config:\n{e}")
         return 1
     try:
         renderer = GLRenderer(settings.d)
@@ -1663,6 +2338,8 @@ def main() -> int:
         return 1
     win = MainWindow(ctx, renderer, settings)
     win.show()
+    if warnings:
+        QtWidgets.QMessageBox.warning(win, "OCIO config", "\n\n".join(warnings))
     return app.exec()
 
 
