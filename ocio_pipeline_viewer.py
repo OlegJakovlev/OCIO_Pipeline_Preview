@@ -1517,7 +1517,7 @@ class MainWindow(QtWidgets.QMainWindow):
         l3.addRow(self.shader_panel)
         self.shader_panel.setVisible(self.chk_shader.isChecked())   # hidden until the checkbox is ticked
 
-        g4 = QtWidgets.QGroupBox("3 · Input matrix override (Linear Rec.709 → working space)")
+        g4 = QtWidgets.QGroupBox("3 · Working-space conversion override")
         l4 = QtWidgets.QVBoxLayout(g4)
         self.chk_matrix = QtWidgets.QCheckBox("Use this matrix instead of the OCIO transform")
         l4.addWidget(self.chk_matrix)
